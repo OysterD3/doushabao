@@ -1,0 +1,28 @@
+{
+  "name": "doushabao",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DingTalk digital employee: dws events in, pi agent workspaces think, replies out.",
+  "scripts": {
+    "start": "node src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "e2e": "vitest run --config vitest.e2e.config.ts",
+    "gate": "tsc --noEmit && vitest run && vitest run --config vitest.e2e.config.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "croner": "10.0.1",
+    "mammoth": "1.12.1",
+    "pdf-parse": "2.4.5",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

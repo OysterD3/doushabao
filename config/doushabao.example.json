@@ -1,0 +1,17 @@
+{
+  "admins": ["<your-open-dingtalk-id>"],
+  "timezone": "Asia/Shanghai",
+  "dwsBin": "dws",
+  "piBin": "pi",
+  "models": {
+    "default": "",
+    "distillation": "",
+    "vision": ""
+  },
+  "http": { "host": "127.0.0.1", "port": 8787 },
+  "heartbeat": {
+    "quietMinutes": 90,
+    "workHours": { "start": 9, "end": 19, "days": [1, 2, 3, 4, 5] }
+  },
+  "nightly": { "hour": 3 }
+}

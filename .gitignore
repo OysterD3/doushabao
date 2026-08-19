@@ -1,0 +1,11 @@
+node_modules/
+docs/
+var/
+workspaces/
+*.log
+.env
+.DS_Store
+.idea/
+
+# Real config holds admin DingTalk IDs — keep it local, ship the example.
+config/doushabao.json
