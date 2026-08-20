@@ -2,8 +2,12 @@ import { afterEach, describe, expect, test } from "vitest";
 import { chmodSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigSchema, type Config } from "../shared/types.ts";
+import { ConfigSchema, expertToolNames, type Config } from "../shared/types.ts";
+import { paths } from "../shared/paths.ts";
 import { createPiRunner } from "./index.ts";
+
+/** Mirrors the constant in index.ts: the one read-only extension, outside every workspace. */
+const SHARED_EXTENSION = join(paths.experts, "_shared", "extensions", "doushabao.ts");
 
 const FAKE_PI = join(import.meta.dirname, "../../test/fakes/fake-pi.ts");
 
@@ -52,6 +56,7 @@ describe("createPiRunner", () => {
       sessionId: "2026-08-19-conv1",
       prompt: "what's the weather like",
       env: { FAKE_PI_SCENARIO: scenario },
+      tools: [],
     });
 
     expect(result).toEqual({ text: "It is sunny.", ok: true });
@@ -69,6 +74,7 @@ describe("createPiRunner", () => {
       sessionId: "2026-08-19-conv1",
       prompt: "hello there",
       env: { FAKE_PI_SCENARIO: scenario },
+      tools: [],
     });
 
     expect(result).toEqual({ text: "ok", ok: true });
@@ -93,6 +99,7 @@ describe("createPiRunner", () => {
         prompt: "some prompt text",
         model: optsModel,
         env: { FAKE_PI_SCENARIO: scenario, FAKE_PI_LOG: log },
+        tools: ["doushabao_send"],
       });
 
       const entry = lastLogEntry(log);
@@ -106,10 +113,17 @@ describe("createPiRunner", () => {
         "--session-id",
         "2026-08-19-conv1",
         ...(expectedModelArgs ?? []),
+        "-t",
+        "doushabao_send",
         "-nbt",
         "-ne",
+        "-nc",
+        "-ns",
+        "-np",
         "-e",
-        join(tmp, ".pi", "extensions", "doushabao.ts"),
+        SHARED_EXTENSION,
+        "--append-system-prompt",
+        join(tmp, "AGENTS.md"),
         "some prompt text",
       ];
       expect(entry.argv).toEqual(expectedArgv);
@@ -128,16 +142,70 @@ describe("createPiRunner", () => {
         sessionId: "s1",
         prompt: "x",
         env: { FAKE_PI_SCENARIO: scenario, FAKE_PI_LOG: log },
+        tools: [],
       });
 
       const { argv } = lastLogEntry(log);
-      // -nbt alone is not enough: without -ne the workspace inherits whatever
+      // -nbt alone is not enough. Without -ne the workspace inherits whatever
       // extensions live in the host account's ~/.pi (shell-granting ones
-      // included), and without -e ours never loads at all, because pi gates
-      // project-local .pi/extensions/ behind project trust.
-      expect(argv).toContain("-nbt");
-      expect(argv).toContain("-ne");
-      expect(argv[argv.indexOf("-e") + 1]).toBe(join(tmp, ".pi", "extensions", "doushabao.ts"));
+      // included); without -nc/-ns/-np it inherits the operator's personal
+      // AGENTS.md, skills and prompt templates into a prompt-injectable,
+      // chat-facing agent; and without -e ours never loads at all, because pi
+      // gates project-local .pi/extensions/ behind project trust.
+      for (const flag of ["-nbt", "-ne", "-nc", "-ns", "-np"]) expect(argv).toContain(flag);
+
+      // The extension is loaded from OUTSIDE every workspace, so no future
+      // workspace-write capability could rewrite the agent's own tools.
+      const extPath = argv[argv.indexOf("-e") + 1]!;
+      expect(extPath).toBe(SHARED_EXTENSION);
+      expect(extPath.startsWith(paths.workspaces)).toBe(false);
+
+      // -nc silences context-file discovery, so the expert persona must be
+      // handed over explicitly or it would vanish without any test noticing.
+      expect(argv[argv.indexOf("--append-system-prompt") + 1]).toBe(join(tmp, "AGENTS.md"));
+    });
+
+    test("passes the expert profile's tools as a comma-separated -t allowlist", async () => {
+      tmp = mkdtempSync(join(tmpdir(), "doushabao-pi-"));
+      const scenario = join(tmp, "scenario.json");
+      const log = join(tmp, "log.jsonl");
+      writeFileSync(scenario, JSON.stringify({ default: { text: "ok" } }));
+      const runner = createPiRunner(makeConfig({ piBin: FAKE_PI }));
+
+      await runner.run({
+        workspaceDir: tmp,
+        sessionId: "s1",
+        prompt: "x",
+        env: { FAKE_PI_SCENARIO: scenario, FAKE_PI_LOG: log },
+        tools: expertToolNames("debug"),
+      });
+
+      const entry = lastLogEntry(log);
+      // Derived from the profile, not hardcoded, so it can't go stale when the
+      // profiles change.
+      expect(entry.argv[entry.argv.indexOf("-t") + 1]).toBe(expertToolNames("debug").join(","));
+      // The prompt must stay last, whatever flags precede it.
+      expect(entry.prompt).toBe("x");
+    });
+
+    test("an empty tools list is fail-CLOSED: -nt (no tools), not every-tool-enabled", async () => {
+      tmp = mkdtempSync(join(tmpdir(), "doushabao-pi-"));
+      const scenario = join(tmp, "scenario.json");
+      const log = join(tmp, "log.jsonl");
+      writeFileSync(scenario, JSON.stringify({ default: { text: "ok" } }));
+      const runner = createPiRunner(makeConfig({ piBin: FAKE_PI }));
+
+      await runner.run({
+        workspaceDir: tmp,
+        sessionId: "s1",
+        prompt: "x",
+        env: { FAKE_PI_SCENARIO: scenario, FAKE_PI_LOG: log },
+        tools: [],
+      });
+
+      const { argv } = lastLogEntry(log);
+      expect(argv).toContain("-nt"); // no tools at all
+      expect(argv).not.toContain("-t"); // and certainly not an allowlist
     });
   });
 
@@ -161,6 +229,7 @@ describe("createPiRunner", () => {
       sessionId: "s1",
       prompt: "irrelevant",
       env: { FOO: "bar" },
+      tools: [],
     });
 
     expect(result).toEqual({ text: "ambient=amb1 foo=bar", ok: true });
@@ -183,7 +252,7 @@ describe("createPiRunner", () => {
     const cfg = makeConfig({ piBin: fixture });
     const runner = createPiRunner(cfg);
 
-    const result = await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: {} });
+    const result = await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: {}, tools: [] });
 
     expect(result).toEqual({ text: "final answer", ok: true });
   });
@@ -194,7 +263,7 @@ describe("createPiRunner", () => {
     const cfg = makeConfig({ piBin: fixture });
     const runner = createPiRunner(cfg);
 
-    const result = await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: {} });
+    const result = await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: {}, tools: [] });
 
     expect(result.ok).toBe(false);
     expect(result.text).toBe("");
@@ -214,7 +283,7 @@ describe("createPiRunner", () => {
     const cfg = makeConfig({ piBin: fixture });
     const runner = createPiRunner(cfg);
 
-    const result = await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: {}, timeoutMs: 250 });
+    const result = await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: {}, tools: [], timeoutMs: 250 });
 
     expect(result.ok).toBe(false);
     expect(result.text).toBe("");
@@ -225,7 +294,7 @@ describe("createPiRunner", () => {
     const cfg = makeConfig({ piBin: join(tmpdir(), "doushabao-pi-does-not-exist-xyz") });
     const runner = createPiRunner(cfg);
 
-    const result = await runner.run({ workspaceDir: tmpdir(), sessionId: "s1", prompt: "x", env: {} });
+    const result = await runner.run({ workspaceDir: tmpdir(), sessionId: "s1", prompt: "x", env: {}, tools: [] });
 
     expect(result.ok).toBe(false);
     expect(result.text).toBe("");

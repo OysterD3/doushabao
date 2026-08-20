@@ -40,9 +40,12 @@ export async function runNightlyForWorkspace(ws: WorkspaceMeta, deps: NightlyDep
     sessionId: `distill-${date}`,
     prompt: tail ? `${tail}\n\n${HANDOFF_INSTRUCTION}` : HANDOFF_INSTRUCTION,
     model,
-    // System-triggered run: no human sender. Deliberately tool-less — without
-    // DOUSHABAO_API/DOUSHABAO_TOKEN every doushabao_* tool refuses, so distillation
-    // can only produce text, which this function writes to handoff.md itself.
+    // System-triggered run: no human sender, and deliberately TOOL-LESS.
+    // `tools: []` makes the runner pass `-nt`, so the model does not even see
+    // the doushabao_* surface (belt to the missing DOUSHABAO_API/TOKEN, which
+    // would make every tool refuse anyway). Distillation only produces text,
+    // which this function writes to handoff.md.
+    tools: [],
     env: { DOUSHABAO_CONVERSATION: ws.conversationId, DOUSHABAO_SENDER: "system" },
   });
   if (result.ok) {

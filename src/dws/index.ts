@@ -28,7 +28,26 @@ import type {
   InboundMessage,
   InboundReaction,
 } from "../shared/types.ts";
-import { paths } from "../shared/paths.ts";
+import { paths, resolveInside } from "../shared/paths.ts";
+import { dwsArgv } from "../shared/argv.ts";
+import { dwsChildEnv } from "../shared/env.ts";
+import { checkDocHost } from "../shared/dochost.ts";
+
+// ---------------------------------------------------------------------------
+// Child environment
+// ---------------------------------------------------------------------------
+
+/**
+ * dws children get an allowlisted env, never the daemon's own — the IPC bearer
+ * token (DOUSHABAO_TOKEN) and provider keys must not leak to a dws child, which
+ * authenticates from its own state under $HOME. The allowlist itself lives in
+ * shared/env.ts (dwsChildEnv), shared with worktools so the two dws-spawning
+ * modules cannot drift. Built per spawn, not at load: tests set FAKE_DWS_*
+ * after import.
+ */
+function childEnv(): Record<string, string> {
+  return dwsChildEnv();
+}
 
 // ---------------------------------------------------------------------------
 // Event keys (ARCHITECTURE.md "dws invocation contract")
@@ -289,11 +308,13 @@ async function runConsumer(
   let backoffMs = BACKOFF_MIN_MS;
   while (!state.stopped) {
     logGapMarker(key);
-    // Pass process.env explicitly so runtime changes (tests set FAKE_DWS_*
-    // env vars after this process started) reach the child.
+    // Literal argv, deliberately not built with dwsArgv: `key` is a compile-time
+    // constant from EVENT_KEYS (never caller data), event keys contain `_` which
+    // dwsArgv's command-token rule refuses, and `--flatten` is a bare flag with
+    // no value slot. There is no value slot here for anything to be injected into.
     const child = spawn(cfg.dwsBin, ["event", "consume", key, "--flatten", "-f", "ndjson"], {
       stdio: ["ignore", "pipe", "ignore"],
-      env: process.env,
+      env: childEnv(),
     });
     state.child = child;
     let sawLine = false;
@@ -339,11 +360,9 @@ async function runConsumer(
 // One-shot dws invocations
 // ---------------------------------------------------------------------------
 
-async function runOnce(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  // See the comment in runConsumer: env must be passed explicitly.
-  const [bin, ...rest] = argv;
+async function runOnce(bin: string, argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return await new Promise((resolve) => {
-    const child = spawn(bin ?? "", rest, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    const child = spawn(bin, argv, { stdio: ["ignore", "pipe", "pipe"], env: childEnv() });
     let stdout = "";
     let stderr = "";
     child.stdout?.setEncoding("utf8");
@@ -374,11 +393,45 @@ function extractMessageId(stdout: string): string | undefined {
   return undefined;
 }
 
-/** A message id comes from dws — never interpolate it raw into a path. Dots are
- * not in the allowlist, so no id can produce `.`, `..`, or a hidden name. */
+/** A message id reaches us from dws AND from the model (worktools' media_fetch
+ * takes it as a tool parameter) — never interpolate it raw into a path. Dots are
+ * not in the allowlist, so no id can produce `.`, `..`, or a hidden name. The
+ * caller must still contain the result with resolveInside: a sanitiser fails
+ * open the day its character class is widened, containment does not. */
 function messageDirName(messageId: string): string {
   const safe = messageId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 100);
   return safe.length > 0 ? safe : "unknown-message";
+}
+
+/**
+ * The `--text` slot is the one place where refusing is worse than adapting.
+ *
+ * Every other value we hand dws is an id, a URL or a path: one that begins with
+ * `-` is malformed, and the only safe answer is to refuse and not spawn. The
+ * message text is model-authored prose for a human to read, and prose that
+ * begins with `-` is ordinary — a markdown bullet list, a negative number, a
+ * dash. Refusing would throw away a real reply; stripping the `-` would change
+ * what the user is told.
+ *
+ * So we prepend a newline. dws's parser no longer sees an option (the element
+ * does not start with `-`), every byte the model wrote survives unchanged, and
+ * a leading blank line still opens a markdown block, so `- a\n- b` renders as
+ * the list it was meant to be.
+ */
+function textValue(text: string): string {
+  return text.startsWith("-") ? `\n${text}` : text;
+}
+
+/**
+ * Second layer under worktools' doc_read checks. exportDoc is where the URL
+ * actually becomes an outbound fetch by the dws child, so the allowlist is
+ * enforced at the spawn site too: if doc_read ever loses its check, or another
+ * caller reaches this port, an arbitrary host is still not fetchable.
+ * Exact hostname match — a lookalike or a trailing dot fails closed.
+ */
+function assertDocHost(cfg: Config, docUrl: string): void {
+  const res = checkDocHost(cfg.docHosts, docUrl);
+  if (!res.ok) throw new Error(`dws exportDoc refused: ${res.message}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -465,21 +518,17 @@ export function createDws(cfg: Config): DwsPort {
 
     async sendText(conversationId, conversationType, text) {
       return sendQueue.push(async () => {
-        const argv =
-          conversationType === "group"
-            ? [cfg.dwsBin, "chat", "+messages-send", "--as", "user", "--group", conversationId, "--text", text]
-            : [
-                cfg.dwsBin,
-                "chat",
-                "+messages-send",
-                "--as",
-                "user",
-                "--open-dingtalk-id",
-                conversationId,
-                "--text",
-                text,
-              ];
-        const result = await runOnce(argv);
+        // A conversation id that starts with "-" or carries a NUL is malformed,
+        // not prose: dwsArgv throws and nothing is spawned.
+        const argv = dwsArgv(
+          ["chat", "+messages-send"],
+          [
+            ["--as", "user"],
+            [conversationType === "group" ? "--group" : "--open-dingtalk-id", conversationId],
+            ["--text", textValue(text)],
+          ],
+        );
+        const result = await runOnce(cfg.dwsBin, argv);
         if (result.exitCode !== 0) {
           throw new Error(`dws sendText failed (exit ${result.exitCode}): ${result.stderr}`);
         }
@@ -488,6 +537,9 @@ export function createDws(cfg: Config): DwsPort {
     },
 
     async downloadMedia(conversationId, conversationType, messageId, destDir) {
+      // Build the destination before spawning: a messageId that cannot be
+      // contained must refuse the whole call, not leave a fetched staging dir.
+      const messageDir = resolveInside(destDir, messageDirName(messageId));
       mkdirSync(destDir, { recursive: true });
       // Download into a fresh dir so the result is "what this call fetched",
       // not "what was not in destDir already" — otherwise a second fetch in a
@@ -495,26 +547,25 @@ export function createDws(cfg: Config): DwsPort {
       // rename on one filesystem.
       const staging = mkdtempSync(join(destDir, ".dl-"));
       try {
-        const argv = [
-          cfg.dwsBin,
-          "chat",
-          "+chat-messages",
-          ...(conversationType === "group" ? ["--group", conversationId] : ["--open-dingtalk-id", conversationId]),
-          "--download-resources",
-          "--output-dir",
-          staging,
-        ];
-        const result = await runOnce(argv);
+        const argv = dwsArgv(
+          ["chat", "+chat-messages"],
+          [
+            [conversationType === "group" ? "--group" : "--open-dingtalk-id", conversationId],
+            ["--output-dir", staging],
+          ],
+        );
+        argv.push("--download-resources"); // bare flag: a constant, no value slot
+        const result = await runOnce(cfg.dwsBin, argv);
         if (result.exitCode !== 0) {
           throw new Error(`dws downloadMedia failed (exit ${result.exitCode}): ${result.stderr}`);
         }
         // HONEST LIMITATION: dws has no per-message download — this fetches the
         // conversation's attachments. messageId only scopes the destination, so
         // the files here may belong to other messages of the conversation.
-        const messageDir = join(destDir, messageDirName(messageId));
         mkdirSync(messageDir, { recursive: true });
         return readdirSync(staging).map((name) => {
-          const target = join(messageDir, name);
+          // Names come from the dws child, so contain them too.
+          const target = resolveInside(messageDir, name);
           rmSync(target, { recursive: true, force: true }); // a re-fetch replaces the older copy
           renameSync(join(staging, name), target);
           return target;
@@ -525,8 +576,16 @@ export function createDws(cfg: Config): DwsPort {
     },
 
     async exportDoc(docUrl, destFile) {
-      const argv = [cfg.dwsBin, "doc", "+export", "--node", docUrl, "--export-format", "markdown", "--output", destFile];
-      const result = await runOnce(argv);
+      assertDocHost(cfg, docUrl);
+      const argv = dwsArgv(
+        ["doc", "+export"],
+        [
+          ["--node", docUrl],
+          ["--export-format", "markdown"],
+          ["--output", destFile],
+        ],
+      );
+      const result = await runOnce(cfg.dwsBin, argv);
       if (result.exitCode !== 0) {
         throw new Error(`dws exportDoc failed (exit ${result.exitCode}): ${result.stderr}`);
       }
@@ -534,7 +593,7 @@ export function createDws(cfg: Config): DwsPort {
 
     async doctor() {
       try {
-        const result = await runOnce([cfg.dwsBin, "auth", "status"]);
+        const result = await runOnce(cfg.dwsBin, dwsArgv(["auth", "status"]));
         if (result.exitCode === 0) {
           return { ok: true, detail: result.stdout.trim() || "ok" };
         }

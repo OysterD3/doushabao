@@ -8,9 +8,13 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { Config, PiRunnerPort } from "../shared/types.ts";
-import { wsPaths } from "../shared/paths.ts";
+import { paths, wsPaths } from "../shared/paths.ts";
 
-export { instantiateBoilerplate } from "./boilerplate.ts";
+export { instantiateExpert } from "./expert.ts";
+
+/** The one extension every workspace runs, loaded read-only from outside any
+ * workspace directory so nothing the agent could ever write can alter it. */
+const SHARED_EXTENSION = join(paths.experts, "_shared", "extensions", "doushabao.ts");
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 /** Cap on how much stderr we keep around for the error message on a nonzero exit. */
@@ -67,6 +71,20 @@ export function createPiRunner(cfg: Config): PiRunnerPort {
       const model = opts.model || cfg.models.default;
       const argv = ["-p", "--mode", "json", "--session-id", opts.sessionId];
       if (model) argv.push("--model", model);
+      // -t is the expert profile's allowlist: one comma-separated list of tool
+      // names, applying to built-in, extension and custom tools alike, so the
+      // model never even sees a tool this workspace's expert does not grant.
+      // Omitted when the caller passes none — then every extension tool stays
+      // enabled, as it did before profiles existed.
+      // Capability boundary, fail-CLOSED. `tools` is required (see the port),
+      // so a caller cannot silently fall through to "all tools enabled":
+      //  - a non-empty list  -> `-t a,b,c`  (exactly those extension tools)
+      //  - an empty list     -> `-nt`       (no tools at all — e.g. nightly)
+      // An earlier `opts.tools?.length` check treated [] like undefined and
+      // enabled everything; that inverted the boundary and is the one place a
+      // forgotten value would grant, not deny.
+      if (opts.tools.length > 0) argv.push("-t", opts.tools.join(","));
+      else argv.push("-nt");
       // Tool surface, locked down in three flags — see ARCHITECTURE.md:
       //  -nbt  no built-in tools (no shell/write/edit) — the no-exec rule.
       //  -ne   no extension DISCOVERY. Without it a workspace inherits every
@@ -77,7 +95,24 @@ export function createPiRunner(cfg: Config): PiRunnerPort {
       //        workspace's .pi/extensions/ is NOT enough: pi loads
       //        project-local extensions only after the project is "trusted",
       //        and nothing can grant that trust in a headless -p run.
-      argv.push("-nbt", "-ne", "-e", join(wsPaths(opts.workspaceDir).piExtensions, "doushabao.ts"), opts.prompt);
+      //  -nc   no context-file DISCOVERY. pi otherwise walks up from cwd and
+      //        also loads the host account's ~/.pi/agent/AGENTS.md, so whatever
+      //        the operator wrote for their own personal use would be injected
+      //        into a chat-facing, prompt-injectable agent.
+      //  -ns   no skills discovery, same reasoning.
+      //  -np   no prompt-template discovery, same reasoning.
+      //  -e    load our own extension by path, from the single read-only copy
+      //        under experts/ — NOT from inside the workspace, so no future
+      //        workspace-write capability can rewrite the agent's own tools.
+      //        Auto-discovery would not work anyway: pi only loads
+      //        project-local extensions after the project is "trusted", and
+      //        nothing can grant that trust in a headless -p run.
+      argv.push("-nbt", "-ne", "-nc", "-ns", "-np", "-e", SHARED_EXTENSION);
+      // -nc disabled discovery of EVERY context file, including this
+      // workspace's own AGENTS.md — which is the expert persona. Put it back
+      // explicitly, so the agent gets exactly one context file: its own.
+      argv.push("--append-system-prompt", wsPaths(opts.workspaceDir).agentsMd);
+      argv.push(opts.prompt);
 
       const env = { ...baseEnv(), ...opts.env };
       const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;

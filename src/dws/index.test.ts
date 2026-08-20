@@ -11,8 +11,8 @@
  * are read by the fake from process.env at spawn time (see its header).
  */
 import { afterEach, describe, expect, test } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync, mkdirSync } from "node:fs";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -64,7 +64,20 @@ afterEach(async () => {
   delete process.env.FAKE_DWS_EVENTS;
   delete process.env.FAKE_DWS_OUTBOX;
   delete process.env.FAKE_DWS_CRASH_AFTER;
+  delete process.env.DOUSHABAO_TOKEN;
 });
+
+/**
+ * A stand-in "dws binary" that appends its whole environment to `dumpFile`.
+ * The env the child actually receives is only observable from inside the
+ * child, so the assertion has to come from the child itself.
+ */
+async function writeEnvDumpBin(dir: string, dumpFile: string): Promise<string> {
+  const bin = join(dir, "env-dump-dws");
+  await writeFile(bin, `#!/bin/sh\nenv >> '${dumpFile}'\necho '{"ok":true}'\n`);
+  await chmod(bin, 0o755);
+  return bin;
+}
 
 describe("event normalization", () => {
   test("dm message, group message, and reaction operation_type variants", async () => {
@@ -421,7 +434,8 @@ describe("media, doc export, doctor", () => {
 
     const dws = createDws(makeCfg());
     activeDws = dws;
-    await dws.exportDoc("https://dingtalk.example/doc/abc", destFile);
+    // Host must be in cfg.docHosts (schema default covers alidocs.dingtalk.com).
+    await dws.exportDoc("https://alidocs.dingtalk.com/doc/abc", destFile);
 
     const content = await readFile(destFile, "utf8");
     expect(content).toContain("# fake doc");
@@ -440,5 +454,192 @@ describe("media, doc export, doctor", () => {
     const missingDws = createDws(makeCfg({ dwsBin: join(dir, "does-not-exist-binary") }));
     const badResult = await missingDws.doctor();
     expect(badResult.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Option injection. Every value slot is caller data; dws parses any argv
+// element starting with "-" as an option. The load-bearing assertion on a
+// refusal is that NOTHING was spawned — the outbox file never appears.
+// ---------------------------------------------------------------------------
+
+describe("option injection at the dws argv boundary", () => {
+  test("reply text starting with '-' is delivered whole, prefixed with a newline", async () => {
+    const dir = await nextFixtureDir();
+    const outbox = join(dir, "outbox.jsonl");
+    process.env.FAKE_DWS_OUTBOX = outbox;
+
+    const dws = createDws(makeCfg());
+    activeDws = dws;
+    const bullets = "- first\n- second";
+    await dws.sendText("g1", "group", bullets);
+    await dws.sendText("g1", "group", "plain reply");
+
+    const sent = await readOutbox(outbox);
+    expect(sent.length).toBe(2);
+    const bulletArgv = sent[0] ?? [];
+    const plainArgv = sent[1] ?? [];
+
+    // The reply reached dws, and every byte the model wrote is still there.
+    const sentText = bulletArgv[bulletArgv.indexOf("--text") + 1];
+    expect(sentText).toBe(`\n${bullets}`);
+    expect(sentText?.slice(1)).toBe(bullets);
+    // A text that cannot be mistaken for an option is passed through untouched.
+    expect(plainArgv[plainArgv.indexOf("--text") + 1]).toBe("plain reply");
+  });
+
+  test("a '--flag'-shaped reply cannot become an option", async () => {
+    const dir = await nextFixtureDir();
+    const outbox = join(dir, "outbox.jsonl");
+    process.env.FAKE_DWS_OUTBOX = outbox;
+
+    const dws = createDws(makeCfg());
+    activeDws = dws;
+    await dws.sendText("g1", "group", "--output-dir=/tmp/pwned --as admin");
+
+    const argv = (await readOutbox(outbox))[0] ?? [];
+    expect(argv).not.toContain("--output-dir=/tmp/pwned --as admin");
+    expect(argv[argv.indexOf("--text") + 1]).toBe("\n--output-dir=/tmp/pwned --as admin");
+    // Exactly one --as, still "user": nothing in the text slot added an option.
+    expect(argv.filter((a) => a === "--as")).toEqual(["--as"]);
+    expect(argv[argv.indexOf("--as") + 1]).toBe("user");
+  });
+
+  test("a NUL in the text is refused and nothing is spawned", async () => {
+    const dir = await nextFixtureDir();
+    const outbox = join(dir, "outbox.jsonl");
+    process.env.FAKE_DWS_OUTBOX = outbox;
+
+    const dws = createDws(makeCfg());
+    activeDws = dws;
+    await expect(dws.sendText("g1", "group", "hello --as admin")).rejects.toThrow(/NUL/);
+    expect(existsSync(outbox)).toBe(false);
+  });
+
+  test("option-shaped ids and doc urls are refused, and nothing is spawned", async () => {
+    const dir = await nextFixtureDir();
+    const outbox = join(dir, "outbox.jsonl");
+    process.env.FAKE_DWS_OUTBOX = outbox;
+    const destFile = join(dir, "never-written.md");
+
+    const dws = createDws(makeCfg());
+    activeDws = dws;
+
+    // conversationId in the selector slot
+    await expect(dws.sendText("--output=/tmp/pwned", "group", "hi")).rejects.toThrow(/starts with "-"/);
+    await expect(dws.sendText("-x", "dm", "hi")).rejects.toThrow(/starts with "-"/);
+    // conversationId in downloadMedia's selector slot
+    await expect(dws.downloadMedia("--output-dir=/tmp/pwned", "group", "m1", join(dir, "media"))).rejects.toThrow(
+      /starts with "-"/,
+    );
+    // docUrl: not even a URL, so the host allowlist refuses it first
+    await expect(dws.exportDoc("--output=/tmp/pwned", destFile)).rejects.toThrow(/exportDoc refused/);
+
+    expect(existsSync(outbox)).toBe(false);
+    expect(existsSync(destFile)).toBe(false);
+  });
+
+  test("exportDoc refuses any host outside cfg.docHosts", async () => {
+    const dir = await nextFixtureDir();
+    const outbox = join(dir, "outbox.jsonl");
+    process.env.FAKE_DWS_OUTBOX = outbox;
+    const destFile = join(dir, "never-written.md");
+
+    const dws = createDws(makeCfg());
+    activeDws = dws;
+
+    for (const url of [
+      "https://evil.example/steal", // exfiltration target
+      "https://alidocs.dingtalk.com.evil.example/doc", // suffix lookalike
+      "https://alidocs.dingtalk.com@evil.example/doc", // userinfo lookalike
+      "file:///etc/passwd", // local file read
+      "http://127.0.0.1:8787/tool", // the daemon's own IPC socket
+    ]) {
+      await expect(dws.exportDoc(url, destFile)).rejects.toThrow(/exportDoc refused/);
+    }
+    expect(existsSync(outbox)).toBe(false);
+    expect(existsSync(destFile)).toBe(false);
+
+    // The same host IS allowed once config says so — the refusal is the
+    // allowlist, not a blanket ban.
+    const openDws = createDws(makeCfg({ docHosts: ["evil.example"] }));
+    await openDws.exportDoc("https://evil.example/steal", destFile);
+    expect(existsSync(destFile)).toBe(true);
+  });
+});
+
+describe("media path containment", () => {
+  test("no messageId can place a file outside destDir", async () => {
+    const dir = await nextFixtureDir();
+    process.env.FAKE_DWS_OUTBOX = join(dir, "outbox.jsonl");
+    const destDir = join(dir, "media-dest");
+
+    const dws = createDws(makeCfg());
+    activeDws = dws;
+
+    for (const messageId of ["../../evil", "/etc/passwd", "....//....//evil", "..\\..\\evil", ".", "..", ""]) {
+      const created = await dws.downloadMedia("g1", "group", messageId, destDir);
+      expect(created.length).toBe(1);
+      for (const file of created) {
+        expect(file.startsWith(destDir + "/")).toBe(true);
+        expect(file).not.toContain("..");
+        expect(existsSync(file)).toBe(true);
+      }
+    }
+    expect(existsSync(join(dir, "evil"))).toBe(false);
+    expect(existsSync(join(destDir, "..", "evil"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Child environment. The daemon holds the IPC bearer token that authorizes
+// every tool call; dws authenticates itself and must not see it.
+// ---------------------------------------------------------------------------
+
+describe("reduced child environment", () => {
+  test("one-shot invocations hand dws PATH + FAKE_DWS_*, never DOUSHABAO_*", async () => {
+    const dir = await nextFixtureDir();
+    const dump = join(dir, "env-dump.txt");
+    const outbox = join(dir, "outbox.jsonl");
+    process.env.FAKE_DWS_OUTBOX = outbox;
+    process.env.DOUSHABAO_TOKEN = "ipc-bearer-token-must-not-leak";
+
+    const dws = createDws(makeCfg({ dwsBin: await writeEnvDumpBin(dir, dump) }));
+    activeDws = dws;
+    const result = await dws.doctor();
+    expect(result.ok).toBe(true);
+
+    const env = await readFile(dump, "utf8");
+    // Positive controls: an empty dump must not be able to pass this test.
+    expect(env).toMatch(/^PATH=/m);
+    expect(env).toContain(`FAKE_DWS_OUTBOX=${outbox}`);
+    // The secrets.
+    expect(env).not.toContain("DOUSHABAO_TOKEN");
+    expect(env).not.toContain("ipc-bearer-token-must-not-leak");
+    expect(env).not.toContain("DOUSHABAO_ROOT");
+  });
+
+  test("consumer children get the same reduced environment", async () => {
+    const dir = await nextFixtureDir();
+    const dump = join(dir, "env-dump.txt");
+    process.env.FAKE_DWS_EVENTS = join(dir, "events.ndjson");
+    process.env.DOUSHABAO_TOKEN = "ipc-bearer-token-must-not-leak";
+
+    const dws = createDws(makeCfg({ dwsBin: await writeEnvDumpBin(dir, dump) }));
+    activeDws = dws;
+    await dws.startConsuming(() => {});
+    // Wait for CONTENT, not just for the file to exist: the child creates the
+    // dump before it finishes writing it, so `existsSync` alone races and the
+    // assertions below then read an empty string.
+    await waitUntil(() => existsSync(dump) && readFileSync(dump, "utf8").includes("PATH="));
+    await dws.stopConsuming();
+    activeDws = undefined;
+
+    const env = await readFile(dump, "utf8");
+    expect(env).toMatch(/^PATH=/m);
+    expect(env).toContain(`FAKE_DWS_EVENTS=${join(dir, "events.ndjson")}`);
+    expect(env).not.toContain("DOUSHABAO_TOKEN");
+    expect(env).not.toContain("ipc-bearer-token-must-not-leak");
+    expect(env).not.toContain("DOUSHABAO_ROOT");
   });
 });

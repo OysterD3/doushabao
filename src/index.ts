@@ -18,6 +18,7 @@ import { createTasks, type Tasks } from "./tasks/index.ts";
 import { createWorktools } from "./worktools/index.ts";
 import { createCron } from "./cron/index.ts";
 import { createApi } from "./api/index.ts";
+import { createGitSnapshotter } from "./gitsnapshot/index.ts";
 import { createRouter, type RunOpts } from "./router/index.ts";
 
 async function main() {
@@ -62,6 +63,10 @@ async function main() {
   await tasks.bootRescan();
   cron.start();
 
+  // Version the workspace tree as its own git repo, if enabled. Off the
+  // message path; a git failure here never affects message handling.
+  const snapshot = cfg.workspacesGit.enabled ? createGitSnapshotter({ cfg }) : undefined;
+
   const sweepInterval = setInterval(() => {
     api.sweepExpired().catch((err: unknown) => {
       console.error("[doushabao] sweepExpired error:", err);
@@ -77,12 +82,23 @@ async function main() {
     await dws.stopConsuming();
     cron.stop();
     await api.stop();
+    // Final commit + push so a change made right before shutdown is not lost.
+    if (snapshot) await snapshot.stop();
     process.exit(0);
   };
   process.on("SIGINT", () => void stop("SIGINT"));
   process.on("SIGTERM", () => void stop("SIGTERM"));
 
   await dws.startConsuming((ev) => router.handleEvent(ev));
+
+  // Started AFTER message consumption is live: ensureRepo() does several git
+  // spawns, and the snapshotter is explicitly off the message path — it must
+  // not delay the daemon's first reply. The first snapshot tick catches any
+  // workspace change that lands in the meantime.
+  if (snapshot) {
+    await snapshot.start();
+    console.log("[doushabao] workspace git snapshotter started");
+  }
 
   console.log(`[doushabao] daemon started, listening on ${ipc.api} (pid ${process.pid}, tz ${cfg.timezone})`);
 }

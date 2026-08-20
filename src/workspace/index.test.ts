@@ -7,13 +7,13 @@
  * Hence the dynamic imports below, after the env var is set, all sharing one
  * tmp root for the whole file. Vitest gives each test file its own process,
  * so this file normally wins that one-time load; if it ever shares a process
- * with a file that sets DOUSHABAO_ROOT first, seedBoilerplateFixture below
+ * with a file that sets DOUSHABAO_ROOT first, seedExpertFixture below
  * covers it — every path derivation after the import still goes through the
  * imported `paths` object, never the locally-remembered `ROOT` string, so
  * this file stays internally consistent regardless of who won.
  */
 import { afterAll, describe, expect, test } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,35 +25,35 @@ const { ConfigSchema } = await import("../shared/types.ts");
 const { createWorkspaceRegistry } = await import("./index.ts");
 type WorkspaceMeta = import("../shared/types.ts").WorkspaceMeta;
 
-// getOrCreate delegates to src/pi's instantiateBoilerplate, which copies
-// boilerplates/<name>/AGENTS.md + .pi/settings.json + the shared extension
-// from paths.boilerplates. src/shared/paths.ts bakes ROOT from
+// getOrCreate delegates to src/pi's instantiateExpert, which copies
+// experts/<name>/AGENTS.md + .pi/settings.json + the shared extension
+// from paths.experts. src/shared/paths.ts bakes ROOT from
 // DOUSHABAO_ROOT once per process, so if this file ever shares one with
 // another test file, `paths` above may be bound to that file's root
 // (whoever imported it first) rather than this file's own ROOT. Seed the fixture
-// under wherever `paths.boilerplates` really points, and only if nothing is
-// there yet — when it resolves to the real repo boilerplates/ (already
+// under wherever `paths.experts` really points, and only if nothing is
+// there yet — when it resolves to the real repo experts/ (already
 // populated), this must be a no-op, not a clobber.
-function seedBoilerplateFixture(): void {
-  const general = join(paths.boilerplates, "general");
+function seedExpertFixture(): void {
+  const general = join(paths.experts, "general");
   if (!existsSync(join(general, "AGENTS.md"))) {
     mkdirSync(join(general, ".pi"), { recursive: true });
-    writeFileSync(join(general, "AGENTS.md"), "# General boilerplate\n");
+    writeFileSync(join(general, "AGENTS.md"), "# General expert\n");
     writeFileSync(join(general, ".pi", "settings.json"), "{}\n");
   }
-  const qaCs = join(paths.boilerplates, "qa-cs");
+  const qaCs = join(paths.experts, "qa-cs");
   if (!existsSync(join(qaCs, "AGENTS.md"))) {
     mkdirSync(join(qaCs, ".pi"), { recursive: true });
-    writeFileSync(join(qaCs, "AGENTS.md"), "# QA/CS boilerplate\n");
+    writeFileSync(join(qaCs, "AGENTS.md"), "# QA/CS expert\n");
     writeFileSync(join(qaCs, ".pi", "settings.json"), '{"qa": true}\n');
   }
-  const sharedExt = join(paths.boilerplates, "_shared", "extensions");
+  const sharedExt = join(paths.experts, "_shared", "extensions");
   if (!existsSync(join(sharedExt, "doushabao.ts"))) {
     mkdirSync(sharedExt, { recursive: true });
     writeFileSync(join(sharedExt, "doushabao.ts"), "// fixture extension\n");
   }
 }
-seedBoilerplateFixture();
+seedExpertFixture();
 
 const cfg = ConfigSchema.parse({ timezone: "Asia/Shanghai" });
 
@@ -62,7 +62,7 @@ afterAll(() => {
 });
 
 /** Seed a workspace directory on disk exactly as getOrCreate would, without
- * going through instantiateBoilerplate (owned by src/pi) — lets every method
+ * going through instantiateExpert (owned by src/pi) — lets every method
  * other than getOrCreate itself be tested independent of that module. */
 function seedWorkspace(cid: string, overrides: Partial<WorkspaceMeta> = {}): WorkspaceMeta {
   const dir = join(paths.workspaces, cid.replace(/[^a-z0-9]/gi, "_"));
@@ -71,7 +71,7 @@ function seedWorkspace(cid: string, overrides: Partial<WorkspaceMeta> = {}): Wor
     conversationId: cid,
     conversationType: "group",
     dir,
-    boilerplate: "general",
+    expert: "general",
     editors: [],
     multimodal: false,
     digestsEnabled: false,
@@ -90,7 +90,7 @@ describe("creation + layout (getOrCreate, via src/pi)", () => {
     expect(created).toBe(true);
     expect(meta.conversationId).toBe("cid-create-1");
     expect(meta.conversationType).toBe("group");
-    expect(meta.boilerplate).toBe("general");
+    expect(meta.expert).toBe("general");
     expect(meta.editors).toEqual([]);
     expect(meta.multimodal).toBe(false);
     expect(meta.digestsEnabled).toBe(false);
@@ -147,35 +147,35 @@ describe("patchMeta", () => {
     await expect(reg.patchMeta("does-not-exist", { owner: "x" })).rejects.toThrow();
   });
 
-  test("switching the boilerplate re-materializes the new template, keeping workspace-local state", async () => {
+  test("switching the expert re-materializes the new template, keeping workspace-local state", async () => {
     const reg = createWorkspaceRegistry(cfg);
     const { meta } = await reg.getOrCreate("cid-patch-bp", "group");
     await reg.appendTranscript("cid-patch-bp", { ts: Date.now(), senderId: "u1", text: "hello" });
     await reg.memoryAdmin("cid-patch-bp", "write", "facts", "# Facts");
 
-    const updated = await reg.patchMeta("cid-patch-bp", { boilerplate: "qa-cs" });
-    expect(updated.boilerplate).toBe("qa-cs");
+    const updated = await reg.patchMeta("cid-patch-bp", { expert: "qa-cs" });
+    expect(updated.expert).toBe("qa-cs");
 
     const agentsMd = readFileSync(wsPaths(meta.dir).agentsMd, "utf8");
-    expect(agentsMd).toBe(readFileSync(join(paths.boilerplates, "qa-cs", "AGENTS.md"), "utf8"));
-    expect(agentsMd).not.toBe(readFileSync(join(paths.boilerplates, "general", "AGENTS.md"), "utf8"));
-    expect(readFileSync(wsPaths(meta.dir).piSettings, "utf8")).toBe(readFileSync(join(paths.boilerplates, "qa-cs", ".pi", "settings.json"), "utf8"));
+    expect(agentsMd).toBe(readFileSync(join(paths.experts, "qa-cs", "AGENTS.md"), "utf8"));
+    expect(agentsMd).not.toBe(readFileSync(join(paths.experts, "general", "AGENTS.md"), "utf8"));
+    expect(readFileSync(wsPaths(meta.dir).piSettings, "utf8")).toBe(readFileSync(join(paths.experts, "qa-cs", ".pi", "settings.json"), "utf8"));
 
     // state that is not part of the template survives the switch
     expect(await reg.transcriptTail("cid-patch-bp", 5)).toHaveLength(1);
     expect((await reg.memoryAdmin("cid-patch-bp", "read", "facts")).data).toBe("# Facts");
   });
 
-  test("rejects an unknown boilerplate name, leaving meta and disk on the old template", async () => {
+  test("rejects an unknown expert name, leaving meta and disk on the old template", async () => {
     const reg = createWorkspaceRegistry(cfg);
     const { meta } = await reg.getOrCreate("cid-patch-bp-bad", "group");
-    await expect(reg.patchMeta("cid-patch-bp-bad", { boilerplate: "qa_cs" as never })).rejects.toThrow(/unknown boilerplate/);
-    expect(reg.get("cid-patch-bp-bad")?.boilerplate).toBe("general");
-    expect(createWorkspaceRegistry(cfg).get("cid-patch-bp-bad")?.boilerplate).toBe("general");
-    expect(readFileSync(wsPaths(meta.dir).agentsMd, "utf8")).toBe(readFileSync(join(paths.boilerplates, "general", "AGENTS.md"), "utf8"));
+    await expect(reg.patchMeta("cid-patch-bp-bad", { expert: "qa_cs" as never })).rejects.toThrow(/unknown expert/);
+    expect(reg.get("cid-patch-bp-bad")?.expert).toBe("general");
+    expect(createWorkspaceRegistry(cfg).get("cid-patch-bp-bad")?.expert).toBe("general");
+    expect(readFileSync(wsPaths(meta.dir).agentsMd, "utf8")).toBe(readFileSync(join(paths.experts, "general", "AGENTS.md"), "utf8"));
   });
 
-  test("a patch that does not change the boilerplate re-materializes nothing", async () => {
+  test("a patch that does not change the expert re-materializes nothing", async () => {
     const reg = createWorkspaceRegistry(cfg);
     const { meta } = await reg.getOrCreate("cid-patch-bp-noop", "group");
     writeFileSync(wsPaths(meta.dir).agentsMd, "# hand-edited\n");
@@ -183,7 +183,7 @@ describe("patchMeta", () => {
     await reg.patchMeta("cid-patch-bp-noop", { owner: "u1" });
     expect(readFileSync(wsPaths(meta.dir).agentsMd, "utf8")).toBe("# hand-edited\n");
 
-    await reg.patchMeta("cid-patch-bp-noop", { boilerplate: "general" });
+    await reg.patchMeta("cid-patch-bp-noop", { expert: "general" });
     expect(readFileSync(wsPaths(meta.dir).agentsMd, "utf8")).toBe("# hand-edited\n");
   });
 });
@@ -268,6 +268,117 @@ describe("KB overlay + promote + revoke", () => {
     const listAfterRevoke = await reg.kbList("cid-kb-1");
     expect(listAfterRevoke.find((e) => e.id === wsOnly.id)).toBeUndefined();
     expect(await reg.kbRevoke("nope", "admin1")).toBe(false);
+  });
+});
+
+describe("path traversal via model-supplied ids", () => {
+  /** Valid JSON: an unguarded kbPromote parses the target, copies it into the
+   * shared KB (where it reaches chat) and then unlinks it. Garbage content
+   * would hit kb.ts's corrupt-file catch and the test would pass unfixed. */
+  const SECRET = JSON.stringify({ id: "stolen", question: "creds", answer: "sk-live-TOPSECRET", scope: "workspace", injectedBy: "pi", injectedAt: 1, revoked: false });
+
+  /** Plant a target under the tmp ROOT, at the path a traversing id resolves
+   * to from a workspace kb dir (ROOT/workspaces/<ws>/kb — three levels down). */
+  function plant(...rel: string[]): string {
+    const file = join(ROOT, ...rel);
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(file, SECRET);
+    return file;
+  }
+
+  /** Every file under the tmp root, sorted. The refusal has to be total: a
+   * traversing id must not create, move or unlink a file ANYWHERE — the
+   * unguarded kbRevoke, for instance, copies the target it read into whichever
+   * workspace kb dir it happened to match from, which is not a path a
+   * per-directory assertion would think to look at. */
+  function treeSnapshot(dir: string = ROOT, prefix = ""): string[] {
+    const out: string[] = [];
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) out.push(...treeSnapshot(join(dir, e.name), rel));
+      else out.push(rel);
+    }
+    return out.sort();
+  }
+
+  test("kb_promote refuses a traversing kbId: nothing read, nothing copied into the shared KB, target still on disk", async () => {
+    seedWorkspace("cid-traversal-1");
+    const reg = createWorkspaceRegistry(cfg);
+
+    const config = plant("config", "doushabao.json"); // ../../../config/doushabao
+    const auth = plant(".pi", "agent", "auth.json"); // ../../../.pi/agent/auth
+    const before = treeSnapshot();
+
+    // Collect first, assert the effects first: the point of this test is that
+    // the target survived untouched, not merely what the call returned.
+    const ids = ["../../../config/doushabao", "../../../.pi/agent/auth", "../../../../../.pi/agent/auth", "/etc/passwd", "a/../../../config/doushabao"];
+    const results = await Promise.all(ids.map((kbId) => reg.kbPromote(kbId, "admin1").catch(() => "threw")));
+
+    // the credential store was neither copied into the shared KB nor unlinked
+    expect(treeSnapshot()).toEqual(before);
+    expect(readFileSync(config, "utf8")).toBe(SECRET);
+    expect(readFileSync(auth, "utf8")).toBe(SECRET);
+    // and the refusal is the graceful "not found", same as any unknown id
+    expect(results).toEqual(ids.map(() => undefined));
+  });
+
+  test("kb_revoke refuses a traversing kbId and does not write revoked:true back into the target", async () => {
+    seedWorkspace("cid-traversal-2");
+    const reg = createWorkspaceRegistry(cfg);
+
+    const config = plant("config", "doushabao.json");
+    const auth = plant(".pi", "agent", "auth.json");
+    const before = treeSnapshot();
+
+    const ids = ["../../../config/doushabao", "../../../.pi/agent/auth", "../../../../../.pi/agent/auth", "/etc/passwd"];
+    const results = await Promise.all(ids.map((kbId) => reg.kbRevoke(kbId, "admin1").catch(() => "threw")));
+
+    // no new KB file anywhere: an unguarded revoke reads the target and writes
+    // its contents back as a KB entry, which kb_list/kb_digest then serve
+    expect(treeSnapshot()).toEqual(before);
+    // content, not just existence: revoke rewrites the entry it read
+    expect(readFileSync(config, "utf8")).toBe(SECRET);
+    expect(readFileSync(auth, "utf8")).toBe(SECRET);
+    expect(results).toEqual(ids.map(() => false));
+  });
+
+  test("memory_admin refuses a traversing name for read, write and delete, leaving the target intact", async () => {
+    seedWorkspace("cid-traversal-3");
+    const reg = createWorkspaceRegistry(cfg);
+
+    // memory dir is ROOT/workspaces/<ws>/memory, so ../../../secret lands at ROOT/secret.md
+    const secret = join(ROOT, "secret.md");
+    writeFileSync(secret, SECRET);
+    const before = treeSnapshot();
+
+    const results: boolean[] = [];
+    for (const name of ["../../../secret", "../../../.pi/agent/auth", "../escape", "/etc/passwd", "a/b", "..", "."]) {
+      for (const op of ["read", "write", "delete"] as const) {
+        results.push((await reg.memoryAdmin("cid-traversal-3", op, name, "pwned")).ok);
+      }
+    }
+
+    expect(treeSnapshot()).toEqual(before);
+    expect(readFileSync(secret, "utf8")).toBe(SECRET);
+    expect(results.every((ok) => ok === false)).toBe(true);
+    // and the refused names never reached the listing either
+    expect((await reg.memoryAdmin("cid-traversal-3", "list")).data).toEqual([]);
+  });
+
+  test("a workspace directory stays under paths.workspaces however the conversation id is spelled", async () => {
+    const reg = createWorkspaceRegistry(cfg);
+    for (const cid of ["../../../../etc/passwd", "..", "../evil", "/absolute"]) {
+      const { meta } = await reg.getOrCreate(cid, "group");
+      expect(meta.dir.startsWith(paths.workspaces + "/"), cid).toBe(true);
+    }
+  });
+
+  test("a rewritten workspace.json cannot relocate a workspace out of paths.workspaces", () => {
+    const meta = seedWorkspace("cid-traversal-meta");
+    writeFileSync(wsPaths(meta.dir).meta, JSON.stringify({ ...meta, dir: join(ROOT, ".pi", "agent") }, null, 2));
+
+    const reg = createWorkspaceRegistry(cfg);
+    expect(reg.get("cid-traversal-meta")?.dir).toBe(meta.dir);
   });
 });
 

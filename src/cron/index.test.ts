@@ -1,18 +1,18 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { paths, wsPaths } from "../shared/paths.ts";
 import { ConfigSchema, type Config, type DwsPort, type PiRunnerPort, type WorkspaceMeta } from "../shared/types.ts";
 import { createCron, type CronSvc, type WorkspacesLike } from "./index.ts";
 
-function tmpWorkspace(conversationId = "conv-1"): WorkspaceMeta {
-  const dir = mkdtempSync(join(tmpdir(), "cron-ws-"));
+function tmpWorkspace(conversationId = "conv-1", dir = mkdtempSync(join(tmpdir(), "cron-ws-"))): WorkspaceMeta {
   return {
     conversationId,
     conversationType: "group",
     dir,
-    boilerplate: "general",
+    expert: "general",
     editors: [],
     multimodal: false,
     digestsEnabled: false,
@@ -23,6 +23,21 @@ function tmpWorkspace(conversationId = "conv-1"): WorkspaceMeta {
 
 function fakeWorkspaces(list: WorkspaceMeta[]): WorkspacesLike {
   return { list: () => list };
+}
+
+/**
+ * A workspace laid out like production (<root>/workspaces/<slug>) next to a
+ * <root>/config/doushabao.json, so the literal traversal id from the audit —
+ * "../../../config/doushabao" — resolves exactly onto that config file.
+ */
+function sandboxWorkspace(conversationId: string): { ws: WorkspaceMeta; victim: string } {
+  const root = mkdtempSync(join(tmpdir(), "cron-root-"));
+  const dir = join(root, "workspaces", "ws-1");
+  mkdirSync(wsPaths(dir).jobs, { recursive: true });
+  const victim = join(root, "config", "doushabao.json");
+  mkdirSync(dirname(victim), { recursive: true });
+  writeFileSync(victim, JSON.stringify({ secret: "keep me" }));
+  return { ws: tmpWorkspace(conversationId, dir), victim };
 }
 
 function fakeDws(): DwsPort {
@@ -220,8 +235,97 @@ describe("addJob / listJobs / removeJob", () => {
     expect(svc.removeJob(ws.conversationId, job.id)).toBe(true);
     expect(svc.listJobs(ws.conversationId)).toEqual([]);
     expect(svc.removeJob(ws.conversationId, job.id)).toBe(false);
-    expect(svc.removeJob("unknown-conv", "whatever")).toBe(false);
+    expect(svc.removeJob("unknown-conv", randomUUID())).toBe(false);
   });
+});
+
+describe("job file containment", () => {
+  function svcFor(ws: WorkspaceMeta, enqueueRun: (cid: string) => void = () => {}): CronSvc {
+    const svc = createCron({
+      cfg: baseCfg(),
+      dws: fakeDws(),
+      runner: fakeRunner(),
+      workspaces: fakeWorkspaces([ws]),
+      enqueueRun: async (cid) => enqueueRun(cid),
+    });
+    stopHandles.push(svc);
+    return svc;
+  }
+
+  test("cancel_job with a traversal jobId is refused and the target file survives", () => {
+    const { ws, victim } = sandboxWorkspace("conv-traversal");
+    const svc = svcFor(ws);
+
+    expect(() => svc.removeJob(ws.conversationId, "../../../config/doushabao")).toThrow();
+    expect(existsSync(victim)).toBe(true);
+    // An absolute path is the other half of the same trick.
+    expect(() => svc.removeJob(ws.conversationId, victim.replace(/\.json$/, ""))).toThrow();
+    expect(existsSync(victim)).toBe(true);
+  });
+
+  test("a legitimate uuid job still cancels normally", () => {
+    const { ws } = sandboxWorkspace("conv-legit");
+    const svc = svcFor(ws);
+    const job = svc.addJob({
+      conversationId: ws.conversationId,
+      cronExpr: "0 9 * * *",
+      description: "d",
+      prompt: "p",
+      createdBy: "editor-1",
+    });
+    const file = join(wsPaths(ws.dir).jobs, `${job.id}.json`);
+    expect(existsSync(file)).toBe(true);
+    expect(svc.removeJob(ws.conversationId, job.id)).toBe(true);
+    expect(existsSync(file)).toBe(false);
+    // A well-formed id for a job that is not there is still just "not found".
+    expect(svc.removeJob(ws.conversationId, randomUUID())).toBe(false);
+  });
+
+  test(
+    "a job file whose id is a traversal string is not scheduled and cannot overwrite the target",
+    async () => {
+      const { ws, victim } = sandboxWorkspace("conv-planted");
+      const before = readFileSync(victim, "utf8");
+      const calls: string[] = [];
+      const svc = svcFor(ws, (cid) => calls.push(cid));
+
+      // Correctly named file, hostile `id` inside — the shape persistLastFiredAt
+      // trusts. Firing it would rewrite the config file with this job's JSON.
+      writeFileSync(
+        join(wsPaths(ws.dir).jobs, `${randomUUID()}.json`),
+        JSON.stringify({
+          id: "../../../config/doushabao",
+          conversationId: ws.conversationId,
+          cronExpr: "* * * * * *",
+          description: "planted",
+          prompt: "tick",
+          createdBy: "editor-1",
+          createdAt: Date.now(),
+          enabled: true,
+        }),
+      );
+
+      expect(svc.listJobs(ws.conversationId)).toEqual([]);
+
+      const snapshot = existsSync(paths.cronFired) ? readFileSync(paths.cronFired, "utf8") : undefined;
+      try {
+        svc.start();
+        // Several ~1/s ticks: enough for the planted job to have fired.
+        await new Promise((r) => setTimeout(r, 2_200));
+      } finally {
+        svc.stop();
+        if (snapshot === undefined) {
+          if (existsSync(paths.cronFired)) rmSync(paths.cronFired);
+        } else {
+          writeFileSync(paths.cronFired, snapshot);
+        }
+      }
+
+      expect(calls).toEqual([]);
+      expect(readFileSync(victim, "utf8")).toBe(before);
+    },
+    8_000,
+  );
 });
 
 describe("start() live scheduling", () => {
@@ -244,7 +348,7 @@ describe("start() live scheduling", () => {
       // Write the job file directly (rather than via addJob) so this test
       // doesn't depend on addJob's live-scheduling branch, which gets its
       // own test below.
-      const jobId = "live-fire-job";
+      const jobId = randomUUID();
       const dir = wsPaths(ws.dir).jobs;
       mkdirSync(dir, { recursive: true });
       writeFileSync(
@@ -351,10 +455,11 @@ describe("start() live scheduling", () => {
       for (const ws of [active, paused]) {
         const dir = wsPaths(ws.dir).jobs;
         mkdirSync(dir, { recursive: true });
+        const jobId = randomUUID();
         writeFileSync(
-          join(dir, `job-${ws.conversationId}.json`),
+          join(dir, `${jobId}.json`),
           JSON.stringify({
-            id: `job-${ws.conversationId}`,
+            id: jobId,
             conversationId: ws.conversationId,
             cronExpr: "* * * * * *",
             description: "test",

@@ -23,6 +23,8 @@ process.env.DOUSHABAO_ROOT = ROOT;
 const { createApi } = await import("./index.ts");
 const { paths } = await import("../shared/paths.ts");
 const { ConfigSchema } = await import("../shared/types.ts");
+const { canApprove, isAdmin, isEditor, matchApprovalReply, matchReply } = await import("./authz.ts");
+const { listPending, savePending } = await import("./pending.ts");
 
 import type {
   Config,
@@ -47,7 +49,7 @@ function makeMeta(over: Partial<WorkspaceMeta> & { conversationId: string }): Wo
   return {
     conversationType: "group",
     dir: "/fake-ws",
-    boilerplate: "general",
+    expert: "general",
     editors: [],
     multimodal: false,
     digestsEnabled: false,
@@ -57,7 +59,10 @@ function makeMeta(over: Partial<WorkspaceMeta> & { conversationId: string }): Wo
   };
 }
 
-function makeFakeDws() {
+/** `noMessageIds` mimics a send whose message id never came back (dws prints
+ * no id, or the send response could not be parsed) — the case the old
+ * reaction fallback used to serve. */
+function makeFakeDws(noMessageIds = false) {
   const sent: { conversationId: string; conversationType: string; text: string }[] = [];
   let n = 0;
   const dws: DwsPort = {
@@ -65,7 +70,7 @@ function makeFakeDws() {
     async stopConsuming() {},
     async sendText(conversationId, conversationType, text) {
       sent.push({ conversationId, conversationType, text });
-      return { messageId: `msg-${++n}` };
+      return noMessageIds ? {} : { messageId: `msg-${++n}` };
     },
     async downloadMedia() {
       return [];
@@ -223,9 +228,11 @@ function makeEnqueue() {
   return { calls, enqueueRun };
 }
 
-function makeApi(opts: { cfgOverrides?: Record<string, unknown>; metas?: WorkspaceMeta[]; affectsOthers?: boolean } = {}) {
+function makeApi(
+  opts: { cfgOverrides?: Record<string, unknown>; metas?: WorkspaceMeta[]; affectsOthers?: boolean; noMessageIds?: boolean } = {},
+) {
   const cfg = makeCfg(opts.cfgOverrides);
-  const { dws, sent } = makeFakeDws();
+  const { dws, sent } = makeFakeDws(opts.noMessageIds ?? false);
   const { workspaces, map, kb, patches, unanswered, escalations } = makeFakeWorkspaces(opts.metas ?? []);
   const { tasks, created, retried } = makeFakeTasks();
   const { cron, jobs } = makeFakeCron();
@@ -337,7 +344,12 @@ describe("start/stop + http transport", () => {
 // ---------------------------------------------------------------------------
 
 describe("authz matrix", () => {
-  const ws1 = makeMeta({ conversationId: "ws1", editors: ["editor-1"], owner: "owner-1" });
+  // Each row runs in a workspace whose expert profile actually carries the
+  // tool — otherwise the profile gate would answer first and the tier check
+  // under test would never run. dev-mgmt carries set_workspace/ops/
+  // memory_admin, qa-cs carries the kb_* family.
+  const ws1 = makeMeta({ conversationId: "ws1", expert: "dev-mgmt", editors: ["editor-1"], owner: "owner-1" });
+  const wsQa = makeMeta({ conversationId: "ws-qa", expert: "qa-cs", editors: ["editor-1"], owner: "owner-1" });
 
   async function callAsRow(base: string, token: string, req: ToolRequest): Promise<ToolResponse> {
     const res = await fetch(`${base}/tool`, {
@@ -349,31 +361,19 @@ describe("authz matrix", () => {
   }
 
   test("editor / admin / random-sender rows resolve as specified", async () => {
-    const { api, map } = makeApi({ metas: [ws1] });
+    const { api, map } = makeApi({ metas: [ws1, wsQa] });
     const { port, token } = await api.start();
     try {
       const base = `http://127.0.0.1:${port}`;
 
       // kb_save: editor ok, random denied, admin ok anywhere
-      expect((await callAsRow(base, token, { tool: "kb_save", conversationId: "ws1", senderId: "editor-1", question: "q", answer: "a" })).ok).toBe(true);
-      expect((await callAsRow(base, token, { tool: "kb_save", conversationId: "ws1", senderId: "random", question: "q", answer: "a" })).ok).toBe(false);
-      expect((await callAsRow(base, token, { tool: "kb_save", conversationId: "ws1", senderId: "admin-1", question: "q2", answer: "a2" })).ok).toBe(true);
+      expect((await callAsRow(base, token, { tool: "kb_save", conversationId: "ws-qa", senderId: "editor-1", question: "q", answer: "a" })).ok).toBe(true);
+      expect((await callAsRow(base, token, { tool: "kb_save", conversationId: "ws-qa", senderId: "random", question: "q", answer: "a" })).ok).toBe(false);
+      expect((await callAsRow(base, token, { tool: "kb_save", conversationId: "ws-qa", senderId: "admin-1", question: "q2", answer: "a2" })).ok).toBe(true);
 
       // kb_promote: admins only
-      expect((await callAsRow(base, token, { tool: "kb_promote", conversationId: "ws1", senderId: "editor-1", kbId: "x" })).ok).toBe(false);
-      expect((await callAsRow(base, token, { tool: "kb_promote", conversationId: "ws1", senderId: "random", kbId: "x" })).ok).toBe(false);
-
-      // set_workspace: editor may touch editors/owner/digestsEnabled, not boilerplate/model/multimodal
-      expect(
-        (await callAsRow(base, token, { tool: "set_workspace", conversationId: "ws1", senderId: "editor-1", patch: { digestsEnabled: true } })).ok,
-      ).toBe(true);
-      expect(
-        (await callAsRow(base, token, { tool: "set_workspace", conversationId: "ws1", senderId: "editor-1", patch: { boilerplate: "project" } })).ok,
-      ).toBe(false);
-      expect(
-        (await callAsRow(base, token, { tool: "set_workspace", conversationId: "ws1", senderId: "admin-1", patch: { boilerplate: "project" } })).ok,
-      ).toBe(true);
-      expect((map.get("ws1") as WorkspaceMeta).boilerplate).toBe("project");
+      expect((await callAsRow(base, token, { tool: "kb_promote", conversationId: "ws-qa", senderId: "editor-1", kbId: "x" })).ok).toBe(false);
+      expect((await callAsRow(base, token, { tool: "kb_promote", conversationId: "ws-qa", senderId: "random", kbId: "x" })).ok).toBe(false);
 
       // memory_admin: editor own-workspace ok, random denied
       expect((await callAsRow(base, token, { tool: "memory_admin", conversationId: "ws1", senderId: "editor-1", op: "list" })).ok).toBe(true);
@@ -397,9 +397,124 @@ describe("authz matrix", () => {
         })).ok,
       ).toBe(true);
       expect((await callAsRow(base, token, { tool: "list_jobs", conversationId: "ws1", senderId: "random" })).ok).toBe(true);
+
+      // set_workspace: editor may touch editors/owner/digestsEnabled, not expert/model/multimodal.
+      // Last on purpose: the admin row below repoints ws1 at the project
+      // profile, which no longer carries ops/set_workspace.
+      expect(
+        (await callAsRow(base, token, { tool: "set_workspace", conversationId: "ws1", senderId: "editor-1", patch: { digestsEnabled: true } })).ok,
+      ).toBe(true);
+      expect(
+        (await callAsRow(base, token, { tool: "set_workspace", conversationId: "ws1", senderId: "editor-1", patch: { expert: "project" } })).ok,
+      ).toBe(false);
+      expect(
+        (await callAsRow(base, token, { tool: "set_workspace", conversationId: "ws1", senderId: "admin-1", patch: { expert: "project" } })).ok,
+      ).toBe(true);
+      expect((map.get("ws1") as WorkspaceMeta).expert).toBe("project");
     } finally {
       await api.stop();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Expert profile gate — WHICH tools exist here, asked before WHO may call them
+// ---------------------------------------------------------------------------
+
+describe("expert profile gate", () => {
+  test("a debug workspace refuses kb_save and worktool, and the attempt is audited", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "debug", editors: ["editor-1"] });
+    const { api, kb, executed } = makeApi({ metas: [ws1] });
+
+    const save = await api.handleToolRequest({ tool: "kb_save", conversationId: "ws1", senderId: "editor-1", question: "q", answer: "a" });
+    expect(save.ok).toBe(false);
+    expect(save.message).toContain("not available");
+    expect(save.message).toContain("debug");
+    expect(kb).toEqual([]);
+
+    const work = await api.handleToolRequest({
+      tool: "worktool",
+      conversationId: "ws1",
+      senderId: "editor-1",
+      action: "doc_read",
+      params: { url: "https://example.com/doc" },
+    });
+    expect(work.ok).toBe(false);
+    expect(work.message).toContain("not available");
+    expect(executed).toEqual([]);
+
+    const lines = await readAudit();
+    expect(lines.length).toBe(2);
+    expect(lines[0]).toMatchObject({ actor: "editor-1", action: "kb_save", conversationId: "ws1" });
+    expect((lines[0] as { details: { ok: boolean } }).details.ok).toBe(false);
+    expect(lines[1]).toMatchObject({ actor: "editor-1", action: "worktool:doc_read" });
+    expect((lines[1] as { details: { ok: boolean } }).details.ok).toBe(false);
+  });
+
+  test("an admin is gated too — capability is a property of the workspace, not the caller", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "debug" });
+    const { api } = makeApi({ metas: [ws1] });
+    const res = await api.handleToolRequest({ tool: "kb_save", conversationId: "ws1", senderId: "admin-1", question: "q", answer: "a" });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("not available");
+  });
+
+  test("a qa-cs workspace keeps kb_save", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "qa-cs", editors: ["editor-1"] });
+    const { api, kb } = makeApi({ metas: [ws1] });
+    const res = await api.handleToolRequest({ tool: "kb_save", conversationId: "ws1", senderId: "editor-1", question: "q", answer: "a" });
+    expect(res.ok).toBe(true);
+    expect(kb.length).toBe(1);
+  });
+
+  test("in-profile but unauthorized still returns the permission error, not the profile one", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "qa-cs", editors: ["editor-1"] });
+    const { api } = makeApi({ metas: [ws1] });
+    const res = await api.handleToolRequest({ tool: "kb_save", conversationId: "ws1", senderId: "random", question: "q", answer: "a" });
+    expect(res).toEqual({ ok: false, message: "not authorized" });
+  });
+
+  test("an unknown workspace is not gated — the permission tier still decides", async () => {
+    const { api, kb } = makeApi({ metas: [] });
+    const res = await api.handleToolRequest({ tool: "kb_save", conversationId: "ghost", senderId: "admin-1", question: "q", answer: "a" });
+    expect(res.ok).toBe(true);
+    expect(kb.length).toBe(1);
+    const denied = await api.handleToolRequest({ tool: "kb_save", conversationId: "ghost", senderId: "random", question: "q", answer: "a" });
+    expect(denied).toEqual({ ok: false, message: "not authorized" });
+  });
+
+  test("an approved payload still executes after the workspace expert loses the tool (internal is not gated)", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "project" });
+    const { api, map, executed } = makeApi({ metas: [ws1], affectsOthers: true });
+    const asked = await api.handleToolRequest({
+      tool: "worktool",
+      conversationId: "ws1",
+      senderId: "requester-1",
+      action: "todo_create",
+      params: { title: "t", executorIds: ["colleague-1"] },
+    });
+    expect(asked.ok).toBe(true); // awaiting approval
+    expect(executed.length).toBe(0);
+
+    // The workspace is re-pointed at an expert without worktool while the
+    // approval is still open. The human already approved the deed, so the
+    // orchestrator must still carry it out.
+    map.set("ws1", makeMeta({ conversationId: "ws1", expert: "debug" }));
+
+    const [pendingFile] = await readdir(paths.pending);
+    const pending = JSON.parse(await readFile(join(paths.pending, pendingFile!), "utf8")) as PendingQuestion;
+    const consumed = await api.tryResolvePending({
+      kind: "reaction",
+      eventId: "ev-1",
+      messageId: pending.postedMessageId!,
+      conversationId: "ws1",
+      operatorId: "requester-1",
+      emoji: "thumbsup",
+      operation: "add",
+      receivedAt: Date.now(),
+    });
+    expect(consumed).toBe(true);
+    expect(executed.length).toBe(1);
   });
 });
 
@@ -552,7 +667,10 @@ describe("tryResolvePending reactions", () => {
     expect(consumed).toBe(true);
     expect(enqueue.calls.length).toBe(1);
     expect(enqueue.calls[0]?.prompt).toContain("blue");
-    expect(enqueue.calls[0]?.opts?.senderId).toBe("u1");
+    // The answerer is named in the prompt text, never handed to the run as an
+    // identity — see the "answer never confers authority" tests below.
+    expect(enqueue.calls[0]?.prompt).toContain("u1 answered");
+    expect(enqueue.calls[0]?.opts?.senderId).toBeUndefined();
   });
 });
 
@@ -644,7 +762,7 @@ describe("tryResolvePending messages", () => {
     // must not match; "ok" should fall through to the free-text answer.
     const consumed = await api.tryResolvePending(message({ conversationId: "ws1", senderId: "u1", content: "ok" }));
     expect(consumed).toBe(true);
-    expect(enqueue.calls[0]?.prompt).toContain('answer is: "ok"');
+    expect(enqueue.calls[0]?.prompt).toContain('answered: "ok"');
   });
 
   test("a negated reply ('don't approve') does not fuzzy-match Approve on an approval", async () => {
@@ -712,7 +830,20 @@ describe("tryResolvePending messages", () => {
     expect(pending?.purpose).toBe("approval"); // req.purpose is no longer dropped
 
     sent.length = 0; // clear the initial "posted options" send
-    const consumed = await api.tryResolvePending(message({ conversationId: "ws1", senderId: "requester-1", content: "Approve" }));
+    // Approvals are answered ONLY by the message-bound reaction (a tap on the
+    // exact options message), never by a loose text reply — that binding is
+    // what stops an older approval being farmed by a reply meant for a newer
+    // question. A thumbs-up = option 0 = Approve.
+    const consumed = await api.tryResolvePending({
+      kind: "reaction",
+      eventId: "ev-approve",
+      operation: "add",
+      emoji: "thumbsup",
+      receivedAt: Date.now(),
+      conversationId: "ws1",
+      operatorId: "requester-1",
+      messageId: pending!.postedMessageId!,
+    } as InboundEvent);
     expect(consumed).toBe(true);
     expect(sent).toEqual([]); // no "Declined.", and nothing was executed to announce
     expect(enqueue.calls.length).toBe(1);
@@ -720,6 +851,27 @@ describe("tryResolvePending messages", () => {
 
     const answered = (await readAudit()).find((l) => l.action === "pending_answered");
     expect((answered as { details: { purpose: string } } | undefined)?.details.purpose).toBe("approval");
+  });
+
+  test("a text reply can NOT resolve an approval — only the bound reaction can", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1" });
+    const { api, enqueue } = makeApi({ metas: [ws1] });
+    await api.handleToolRequest({
+      tool: "ask_user",
+      conversationId: "ws1",
+      senderId: "requester-1",
+      question: "May I?",
+      options: ["Approve", "Decline"],
+      defaultOption: -1,
+      purpose: "approval",
+      approverScope: "requester",
+    });
+    // Even the requester, even an exact "Approve", must not resolve it by text.
+    const consumed = await api.tryResolvePending(message({ conversationId: "ws1", senderId: "requester-1", content: "Approve" }));
+    expect(consumed).toBe(false);
+    expect(enqueue.calls.length).toBe(0);
+    const [pending] = await readPendings();
+    expect(pending?.status).toBe("open");
   });
 
   test("declining an internal approval (onApprove set) still replies 'Declined.' and neither executes nor resumes", async () => {
@@ -732,8 +884,20 @@ describe("tryResolvePending messages", () => {
       action: "todo_create",
       params: { title: "t", executorIds: ["colleague-1"] },
     });
+    const [pending] = await readPendings();
     sent.length = 0;
-    const consumed = await api.tryResolvePending(message({ conversationId: "ws1", senderId: "requester-1", content: "Decline" }));
+    // Decline via the bound reaction: thumbs-down = option 1 = Decline on a
+    // two-option approval.
+    const consumed = await api.tryResolvePending({
+      kind: "reaction",
+      eventId: "ev-decline",
+      operation: "add",
+      emoji: "thumbsdown",
+      receivedAt: Date.now(),
+      conversationId: "ws1",
+      operatorId: "requester-1",
+      messageId: pending!.postedMessageId!,
+    } as InboundEvent);
     expect(consumed).toBe(true);
     expect(executed.length).toBe(0);
     expect(enqueue.calls.length).toBe(0);
@@ -745,9 +909,42 @@ describe("tryResolvePending messages", () => {
 // schedule_job approval redirect for non-editors
 // ---------------------------------------------------------------------------
 
+describe("set_workspace on a general room (deadlock regression)", () => {
+  test("an admin can reconfigure a freshly-created general room — set_workspace is not gated by its own expert", async () => {
+    // Every room is created `general`, and set_workspace is the only way to
+    // change that. If the expert-capability gate applied to set_workspace, no
+    // general room could EVER be reconfigured (the tool is absent from its
+    // profile) — a deadlock. set_workspace lives in BASE_TOOLS precisely so
+    // authority (admin tier), not the room's expert, governs it.
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "general" });
+    const { api } = makeApi({ metas: [ws1] });
+
+    const res = await api.handleToolRequest({
+      tool: "set_workspace",
+      conversationId: "ws1",
+      senderId: "admin-1",
+      patch: { expert: "qa-cs" },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.message).not.toContain("not available"); // not the capability-gate refusal
+  });
+
+  test("a non-admin is still refused the admin-only expert field — authority still governs", async () => {
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "general", editors: ["editor-1"] });
+    const { api } = makeApi({ metas: [ws1] });
+    const res = await api.handleToolRequest({
+      tool: "set_workspace",
+      conversationId: "ws1",
+      senderId: "editor-1",
+      patch: { expert: "qa-cs" },
+    });
+    expect(res.ok).toBe(false);
+  });
+});
+
 describe("set_workspace digests", () => {
   test("flipping digestsEnabled materializes and removes the digest jobs", async () => {
-    const ws1 = makeMeta({ conversationId: "ws1", editors: ["editor-1"] });
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "dev-mgmt", editors: ["editor-1"] });
     const { api, jobs } = makeApi({ metas: [ws1] });
 
     const on = await api.handleToolRequest({
@@ -770,7 +967,7 @@ describe("set_workspace digests", () => {
   });
 
   test("a patch without digestsEnabled does not touch cron jobs", async () => {
-    const ws1 = makeMeta({ conversationId: "ws1", editors: ["editor-1"] });
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "dev-mgmt", editors: ["editor-1"] });
     const { api, jobs } = makeApi({ metas: [ws1] });
     const res = await api.handleToolRequest({
       tool: "set_workspace",
@@ -785,7 +982,7 @@ describe("set_workspace digests", () => {
 
 describe("schedule_job editor approval redirect", () => {
   test("non-editor request becomes an editors-scoped approval; an editor's approve reaction schedules the job", async () => {
-    const ws1 = makeMeta({ conversationId: "ws1", editors: ["editor-1"] });
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "project", editors: ["editor-1"] });
     const { api, jobs } = makeApi({ metas: [ws1] });
     const res = await api.handleToolRequest({
       tool: "schedule_job",
@@ -818,7 +1015,7 @@ describe("schedule_job editor approval redirect", () => {
   });
 
   test("editor can schedule directly, no approval needed", async () => {
-    const ws1 = makeMeta({ conversationId: "ws1", editors: ["editor-1"] });
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "project", editors: ["editor-1"] });
     const { api, jobs } = makeApi({ metas: [ws1] });
     const res = await api.handleToolRequest({
       tool: "schedule_job",
@@ -876,7 +1073,8 @@ describe("sweepExpired", () => {
     await api.sweepExpired();
     expect(enqueue.calls.length).toBe(1);
     expect(enqueue.calls[0]?.prompt).toContain("red");
-    expect(enqueue.calls[0]?.opts?.senderId).toBe("system"); // no human answered — the default was auto-applied
+    expect(enqueue.calls[0]?.prompt).toContain("system answered"); // no human answered — the default was auto-applied
+    expect(enqueue.calls[0]?.opts?.senderId).toBeUndefined();
   });
 });
 
@@ -886,7 +1084,7 @@ describe("sweepExpired", () => {
 
 describe("ops", () => {
   test("status reports pendings/tasks/cron; retry_task and pause_workspace mutate state", async () => {
-    const ws1 = makeMeta({ conversationId: "ws1" });
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "dev-mgmt" });
     const { api, tasks, created, retried, patches, map } = makeApi({ metas: [ws1] });
     await tasks.create("ws1", "u1", "do the thing");
     const failingId = created[0]!.id;
@@ -912,7 +1110,7 @@ describe("ops", () => {
 
 describe("audit log", () => {
   test("every handleToolRequest call appends one JSONL entry with actor/action/cid/ok", async () => {
-    const ws1 = makeMeta({ conversationId: "ws1" });
+    const ws1 = makeMeta({ conversationId: "ws1", expert: "qa-cs" });
     const { api } = makeApi({ metas: [ws1] });
     await api.handleToolRequest({ tool: "send_message", conversationId: "ws1", senderId: "u1", text: "hi" });
     await api.handleToolRequest({ tool: "kb_save", conversationId: "ws1", senderId: "random", question: "q", answer: "a" });

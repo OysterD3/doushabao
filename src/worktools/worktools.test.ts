@@ -10,6 +10,7 @@ import {
   type Config,
   type ConversationType,
   type DwsPort,
+  type Expert,
   type WorkspaceMeta,
 } from "../shared/types.ts";
 import { wsPaths } from "../shared/paths.ts";
@@ -21,12 +22,17 @@ function makeCfg(overrides: Record<string, unknown> = {}): Config {
   return ConfigSchema.parse({ dwsBin: FAKE_DWS_BIN, ...overrides });
 }
 
-function makeMeta(dir: string, conversationId = "conv1", conversationType: ConversationType = "group"): WorkspaceMeta {
+function makeMeta(
+  dir: string,
+  conversationId = "conv1",
+  conversationType: ConversationType = "group",
+  expert: Expert = "general",
+): WorkspaceMeta {
   return {
     conversationId,
     conversationType,
     dir,
-    boilerplate: "general",
+    expert,
     editors: [],
     multimodal: false,
     digestsEnabled: false,
@@ -127,7 +133,7 @@ afterEach(() => {
 describe("todo_create", () => {
   test("maps to fixed dws argv, including optional due-time and executors", async () => {
     const cfg = makeCfg();
-    const meta = makeMeta(wsDir);
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
     const res = await wt.execute({
       tool: "worktool",
@@ -153,7 +159,7 @@ describe("todo_create", () => {
 
   test("omits optional flags when absent", async () => {
     const cfg = makeCfg();
-    const meta = makeMeta(wsDir);
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
     const res = await wt.execute({
       tool: "worktool",
@@ -169,7 +175,7 @@ describe("todo_create", () => {
 
   test("rejects invalid params without spawning dws", async () => {
     const cfg = makeCfg();
-    const meta = makeMeta(wsDir);
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
     const res = await wt.execute({
       tool: "worktool",
@@ -186,7 +192,7 @@ describe("todo_create", () => {
 describe("calendar_create", () => {
   test("maps to fixed dws argv, including optional attendees", async () => {
     const cfg = makeCfg();
-    const meta = makeMeta(wsDir);
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
     const res = await wt.execute({
       tool: "worktool",
@@ -221,7 +227,7 @@ describe("calendar_create", () => {
 describe("report_create", () => {
   test("maps to fixed dws argv (best-effort)", async () => {
     const cfg = makeCfg();
-    const meta = makeMeta(wsDir);
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
     const res = await wt.execute({
       tool: "worktool",
@@ -236,6 +242,120 @@ describe("report_create", () => {
   });
 });
 
+describe("option injection", () => {
+  const ISO_A = "2026-08-20T10:00:00+08:00";
+  const ISO_B = "2026-08-20T11:00:00+08:00";
+
+  // `--output=/tmp/x` is ONE argv token, so a single model-chosen value that
+  // starts with "-" sets a dws flag. STRUCTURED fields (ids, template) never
+  // legitimately start with "-", so they are refused before any process
+  // starts: the outbox is the proof, not the ok:false. Prose fields (title /
+  // summary / content) are handled by the adaptation test below instead.
+  test.each([
+    ["todo_create", { title: "Ship it", executorIds: ["u2", "--output=/tmp/pwned"] }, "executorIds"],
+    [
+      "calendar_create",
+      { summary: "Sprint planning", startIso: ISO_A, endIso: ISO_B, attendeeIds: ["--output=/tmp/pwned"] },
+      "attendeeIds",
+    ],
+    ["report_create", { content: "Weekly status", templateName: "--output=/tmp/pwned" }, "templateName"],
+  ] as const)("%s refuses an option-like value in a structured field (%#)", async (action, params, field) => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action,
+      params: params as Record<string, unknown>,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain(field);
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
+  // Prose fields adapt rather than refuse: an option-like title still runs,
+  // but is neutralised (leading space) so dws reads it as the --subject VALUE,
+  // never as a separate --output token. The security property — no injected
+  // flag — holds without failing a benign markdown bullet.
+  test("todo_create adapts an option-like prose title instead of injecting a flag", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "todo_create",
+      params: { title: "--output=/tmp/pwned" },
+    });
+    expect(res.ok).toBe(true);
+    const outbox = await readOutbox(outboxPath);
+    const argv = outbox.at(-1)!;
+    expect(argv).not.toContain("--output=/tmp/pwned"); // never a standalone token
+    const subject = argv[argv.indexOf("--subject") + 1];
+    expect(subject).toBe(" --output=/tmp/pwned"); // the value, space-neutralised
+  });
+
+  test.each([
+    ["todo_create", { title: "Ship it", dueIso: "tomorrow" }],
+    ["todo_create", { title: "Ship it", dueIso: "--due-time=x" }],
+    ["calendar_create", { summary: "Sprint planning", startIso: "whenever", endIso: ISO_B }],
+    ["calendar_create", { summary: "Sprint planning", startIso: ISO_A, endIso: "--end-time=x" }],
+  ] as const)("%s refuses a timestamp that is not a timestamp (%#)", async (action, params) => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action,
+      params: params as Record<string, unknown>,
+    });
+    expect(res.ok).toBe(false);
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
+  test("a refusal costs no write budget, and a legitimate todo still works after one", async () => {
+    const cfg = makeCfg({ budgets: { writesPerWorkspacePerHour: 1 } });
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
+    const refused = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "todo_create",
+      // A structured field (executorIds) still refuses — that is the no-write path.
+      params: { title: "Ship it", executorIds: ["--output=/tmp/pwned"] },
+    });
+    expect(refused.ok).toBe(false);
+    expect(await readOutbox(outboxPath)).toEqual([]);
+
+    const ok = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "todo_create",
+      params: { title: "Ship the report", dueIso: ISO_A, executorIds: ["u2", "u3"] },
+    });
+    expect(ok.ok).toBe(true);
+    const outbox = await readOutbox(outboxPath);
+    expect(outbox.at(-1)).toEqual([
+      "todo",
+      "task",
+      "create",
+      "--subject",
+      "Ship the report",
+      "--due-time",
+      ISO_A,
+      "--executors",
+      "u2,u3",
+    ]);
+  });
+});
+
 describe("doc_read", () => {
   test("refuses urls not shared in this conversation", async () => {
     const cfg = makeCfg();
@@ -246,17 +366,88 @@ describe("doc_read", () => {
       conversationId: "conv1",
       senderId: "u1",
       action: "doc_read",
-      params: { url: "https://docs.example/secret" },
+      params: { url: "https://alidocs.dingtalk.com/secret" },
     });
     expect(res.ok).toBe(false);
     expect(res.message).toBe("doc links must be shared in this conversation first");
     expect(await readOutbox(outboxPath)).toEqual([]);
   });
 
+  // The transcript gate cannot help against these: the attacker types the
+  // message, so the attacker also chooses the string it "was shared" as. Each
+  // url below IS seeded into the transcript, so only the destination check can
+  // refuse it — and the outbox must show no dws process was ever spawned.
+  test("refuses an off-allowlist host even when the url is in the transcript", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const url = "https://evil.tld/exfil?q=secrets";
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `read this: ${url}`) });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "doc_read",
+      params: { url },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("evil.tld");
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
+  test("refuses a non-https url on an allowed host, even when in the transcript", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const url = "http://alidocs.dingtalk.com/plan";
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `read this: ${url}`) });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "doc_read",
+      params: { url },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("https");
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
+  test("refuses a host that only embeds an allowed one (userinfo trick)", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const url = "https://alidocs.dingtalk.com@evil.tld/exfil";
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `read this: ${url}`) });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "doc_read",
+      params: { url },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("evil.tld");
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
+  test("refuses a url that is not a url at all", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const url = "--output=/tmp/pwned";
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `read this: ${url}`) });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "doc_read",
+      params: { url },
+    });
+    expect(res.ok).toBe(false);
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
   test("exports and returns doc content when the url was shared in-conversation", async () => {
     const cfg = makeCfg();
     const meta = makeMeta(wsDir);
-    const url = "https://docs.example/plan";
+    const url = "https://alidocs.dingtalk.com/plan";
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `check this out: ${url}`) });
     const res = await wt.execute({
       tool: "worktool",
@@ -355,6 +546,57 @@ describe("media_fetch", () => {
     expect(existsSync(join(wsPaths(wsDir).media, "big.txt"))).toBe(false);
   });
 
+  // A downloaded filename is chosen by whoever uploaded the file. If it can
+  // name a path outside the media dir, the allowed-extension branch reads a
+  // host file into chat and the refusal branch DELETES a host file.
+  test("refuses paths outside the media dir, reading nothing and deleting nothing", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const outsideTxt = join(tmpRoot, "outside.txt");
+    const outsideExe = join(tmpRoot, "outside.exe");
+    const dws = directDws(async () => {
+      await writeFile(outsideTxt, "host secret");
+      await writeFile(outsideExe, "binary-ish");
+      return [outsideTxt, outsideExe];
+    });
+    const wt = createWorktools({ cfg, dws, workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "media_fetch",
+      params: { messageId: "m1" },
+    });
+    expect(res.ok).toBe(true);
+    const data = res.data as { files: string[]; excerpts: { text: string }[] };
+    expect(data.files).toEqual([]);
+    expect(data.excerpts).toEqual([]);
+    expect(res.message).toContain("outside");
+    expect(existsSync(outsideTxt)).toBe(true);
+    expect(existsSync(outsideExe)).toBe(true);
+  });
+
+  test("refuses a messageId that could climb out of the media dir, without downloading", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    let downloaded = false;
+    const dws = directDws(async () => {
+      downloaded = true;
+      return [];
+    });
+    const wt = createWorktools({ cfg, dws, workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "media_fetch",
+      params: { messageId: "../../../etc" },
+    });
+    expect(res.ok).toBe(false);
+    expect(downloaded).toBe(false);
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
   test("deletes and refuses disallowed file extensions", async () => {
     const cfg = makeCfg();
     const meta = makeMeta(wsDir);
@@ -415,6 +657,30 @@ describe("voice_transcribe", () => {
     expect(outbox.some((argv) => argv[0] === "minutes" && argv[1] === "upload")).toBe(true);
   });
 
+  test("the spike never uploads a file from outside the workspace media dir", async () => {
+    process.env.DOUSHABAO_VOICE_SPIKE = "1";
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const outside = join(tmpRoot, "outside.txt");
+    const dws = directDws(async () => {
+      await writeFile(outside, "host secret");
+      return [outside];
+    });
+    const wt = createWorktools({ cfg, dws, workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "voice_transcribe",
+      params: { messageId: "m1" },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toBe("Voice messages aren't transcribed yet — could you send that as text instead?");
+    const outbox = await readOutbox(outboxPath);
+    expect(outbox.filter((argv) => argv[0] === "minutes")).toEqual([]);
+    expect(existsSync(outside)).toBe(true);
+  });
+
   test("the spike's download passes the workspace's conversationType too", async () => {
     process.env.DOUSHABAO_VOICE_SPIKE = "1";
     const cfg = makeCfg();
@@ -438,6 +704,70 @@ describe("voice_transcribe", () => {
       "--output-dir",
       wsPaths(wsDir).media,
     ]);
+  });
+});
+
+describe("expert profile gate", () => {
+  test("a debug workspace is refused doc_read even for a url shared in-conversation", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir, "conv1", "group", "debug");
+    const url = "https://alidocs.dingtalk.com/plan";
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `here: ${url}`) });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "doc_read",
+      params: { url },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("doc_read");
+    expect(res.message).toContain("debug");
+    expect(await readOutbox(outboxPath)).toEqual([]);
+  });
+
+  test("a general workspace keeps doc_read but is refused todo_create", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir);
+    const url = "https://alidocs.dingtalk.com/plan";
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, `here: ${url}`) });
+    const allowed = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "doc_read",
+      params: { url },
+    });
+    expect(allowed.ok).toBe(true);
+
+    const refused = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "todo_create",
+      params: { title: "Ship it" },
+    });
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain("todo_create");
+    expect(refused.message).toContain("general");
+    const outbox = await readOutbox(outboxPath);
+    expect(outbox.filter((argv) => argv[0] === "todo")).toEqual([]);
+  });
+
+  test("a project workspace is allowed todo_create", async () => {
+    const cfg = makeCfg();
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
+    const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
+    const res = await wt.execute({
+      tool: "worktool",
+      conversationId: "conv1",
+      senderId: "u1",
+      action: "todo_create",
+      params: { title: "Ship it" },
+    });
+    expect(res.ok).toBe(true);
+    const outbox = await readOutbox(outboxPath);
+    expect(outbox.at(-1)).toEqual(["todo", "task", "create", "--subject", "Ship it"]);
   });
 });
 
@@ -465,7 +795,7 @@ describe("affectsOthers", () => {
 describe("writes/hour cap", () => {
   test("blocks mutating actions once the per-workspace budget is exhausted", async () => {
     const cfg = makeCfg({ budgets: { writesPerWorkspacePerHour: 2 } });
-    const meta = makeMeta(wsDir);
+    const meta = makeMeta(wsDir, "conv1", "group", "project");
     const wt = createWorktools({ cfg, dws: fakeBackedDws(), workspaces: makeWorkspaces(meta, "") });
     const call = () =>
       wt.execute({
@@ -488,10 +818,10 @@ describe("writes/hour cap", () => {
 
   test("tracks budgets per conversation independently", async () => {
     const cfg = makeCfg({ budgets: { writesPerWorkspacePerHour: 1 } });
-    const meta1 = makeMeta(wsDir, "conv1");
+    const meta1 = makeMeta(wsDir, "conv1", "group", "project");
     const wsDir2 = join(tmpRoot, "ws2");
     await mkdir(wsDir2, { recursive: true });
-    const meta2 = makeMeta(wsDir2, "conv2");
+    const meta2 = makeMeta(wsDir2, "conv2", "group", "project");
     const workspaces: WorkspacesLike = {
       async get(cid) {
         if (cid === "conv1") return meta1;

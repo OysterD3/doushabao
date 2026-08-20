@@ -12,7 +12,7 @@ import type {
   PiRunnerPort,
   WorkspaceMeta,
 } from "../shared/types.ts";
-import { ConfigSchema } from "../shared/types.ts";
+import { ConfigSchema, expertToolNames } from "../shared/types.ts";
 import { createRouter, type WorkspaceRegistryLike } from "./router.ts";
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ function makeFakeWorkspaces(root: string) {
           conversationId,
           conversationType,
           dir,
-          boilerplate: "general",
+          expert: "general",
           editors: [],
           multimodal: false,
           digestsEnabled: false,
@@ -366,6 +366,33 @@ describe("router", () => {
     await router.handleEvent(dmMessage({ conversationId: "c-vision-none" }));
     await waitFor(() => calls.length === 1);
     expect(calls[0]?.model).toBe("cheap-model");
+  });
+
+  test("each run gets its workspace expert's tool allowlist, so different experts get different tools", async () => {
+    const { registry } = makeFakeWorkspaces(rootDir);
+    await registry.getOrCreate("c-debug", "dm");
+    await registry.patchMeta("c-debug", { greeted: true, expert: "debug" });
+    await registry.getOrCreate("c-project", "dm");
+    await registry.patchMeta("c-project", { greeted: true, expert: "project" });
+    const { dws } = makeFakeDws();
+    const { runner, calls } = makeFakeRunner(async () => ({ text: "ok", ok: true }));
+    const router = createRouter({ cfg: testConfig(), dws, runner, workspaces: registry, ipc: { api: "http://x", token: "t" } });
+
+    // One at a time: separate conversations run in parallel lanes, so
+    // enqueueing both at once leaves `calls` order undefined.
+    await router.enqueueRun("c-debug", "diagnose", { ack: false });
+    await waitFor(() => calls.length === 1);
+    await router.enqueueRun("c-project", "plan the sprint", { ack: false });
+    await waitFor(() => calls.length === 2);
+
+    const debugTools = calls[0]?.tools;
+    const projectTools = calls[1]?.tools;
+    expect(debugTools).toEqual(expertToolNames("debug"));
+    expect(projectTools).toEqual(expertToolNames("project"));
+    // Diagnosis has no side-effect surface; a project workspace does.
+    expect(debugTools).not.toContain("doushabao_worktool");
+    expect(projectTools).toContain("doushabao_worktool");
+    expect(debugTools).not.toEqual(projectTools);
   });
 
   test("paused workspace records the message but starts no run; resuming restores normal handling", async () => {

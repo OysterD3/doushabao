@@ -13,5 +13,13 @@
     "quietMinutes": 90,
     "workHours": { "start": 9, "end": 19, "days": [1, 2, 3, 4, 5] }
   },
-  "nightly": { "hour": 3 }
+  "nightly": { "hour": 3 },
+  "workspacesGit": {
+    "enabled": false,
+    "remote": "",
+    "commitIntervalMs": 20000,
+    "pushIntervalMs": 300000,
+    "authorName": "doushabao",
+    "authorEmail": "doushabao@localhost"
+  }
 }

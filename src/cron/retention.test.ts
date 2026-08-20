@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pruneMedia, pruneTranscript } from "./retention.ts";
@@ -72,5 +72,38 @@ describe("pruneMedia", () => {
     const dir = tmpDir();
     const mediaDir = join(dir, "media");
     expect(() => pruneMedia(mediaDir, 7, Date.now())).not.toThrow();
+  });
+
+  test("refuses a media dir that is a symlink, so no file outside the workspace is deleted", () => {
+    const dir = tmpDir();
+    const outside = join(dir, "outside");
+    mkdirSync(outside);
+    const victim = join(outside, "system.txt");
+    writeFileSync(victim, "not ours");
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    utimesSync(victim, old, old);
+
+    const mediaDir = join(dir, "media");
+    symlinkSync(outside, mediaDir);
+
+    expect(() => pruneMedia(mediaDir, 7, Date.now())).toThrow();
+    expect(existsSync(victim)).toBe(true);
+  });
+
+  test("deletes only regular files — a symlink entry is left alone", () => {
+    const dir = tmpDir();
+    const mediaDir = join(dir, "media");
+    mkdirSync(mediaDir);
+    const outside = join(dir, "outside.txt");
+    writeFileSync(outside, "not ours");
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    utimesSync(outside, old, old);
+    const link = join(mediaDir, "link.txt");
+    symlinkSync(outside, link);
+
+    pruneMedia(mediaDir, 7, Date.now());
+
+    expect(existsSync(outside)).toBe(true);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
   });
 });

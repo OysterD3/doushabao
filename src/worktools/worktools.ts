@@ -23,7 +23,11 @@ import { z } from "zod";
 import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
 import type { Config, DwsPort, ToolRequest, ToolResponse, WorkspaceMeta } from "../shared/types.ts";
-import { wsPaths } from "../shared/paths.ts";
+import { expertAllowsAction } from "../shared/types.ts";
+import { resolveInside, wsPaths } from "../shared/paths.ts";
+import { dwsArgv, isSafeValue, type Flag } from "../shared/argv.ts";
+import { dwsChildEnv } from "../shared/env.ts";
+import { checkDocHost } from "../shared/dochost.ts";
 
 /**
  * Expected shape of the WorkspaceRegistry (src/workspace) that this module
@@ -59,16 +63,36 @@ const UNTRUSTED_MARKER =
 const VOICE_POLITE_MESSAGE = "Voice messages aren't transcribed yet — could you send that as text instead?";
 const WRITE_WINDOW_MS = 60 * 60 * 1000;
 
+/** Date + time, optional seconds, optional zone — e.g. 2026-08-20T10:00:00+08:00.
+ * A free-form string here is a value handed to dws; keeping it to a timestamp
+ * shape removes most of what could be smuggled through it. */
+const ISO_TS_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:?\d{2})?$/;
+const IsoTimestamp = z
+  .string()
+  .regex(ISO_TS_RE, "must be an ISO-8601 timestamp, e.g. 2026-08-20T10:00:00+08:00")
+  .refine((v) => !Number.isNaN(Date.parse(v)), { message: "must be a real timestamp" });
+
+/** A messageId reaches src/dws, which builds a directory name from it. That
+ * module sanitises too; this is the independent first layer, and it blocks
+ * only what a path can be attacked with — the format itself is DingTalk's. */
+const MessageId = z
+  .string()
+  .min(1)
+  .max(200)
+  .refine((v) => !/[\\/\0]/.test(v) && !v.includes(".."), {
+    message: 'must not contain path separators, "..", or NUL',
+  });
+
 const TodoCreateParams = z.object({
   title: z.string().min(1),
-  dueIso: z.string().min(1).optional(),
+  dueIso: IsoTimestamp.optional(),
   executorIds: z.array(z.string().min(1)).optional(),
 });
 
 const CalendarCreateParams = z.object({
   summary: z.string().min(1),
-  startIso: z.string().min(1),
-  endIso: z.string().min(1),
+  startIso: IsoTimestamp,
+  endIso: IsoTimestamp,
   attendeeIds: z.array(z.string().min(1)).optional(),
 });
 
@@ -79,12 +103,46 @@ const ReportCreateParams = z.object({
   templateName: z.string().min(1).optional(),
 });
 
-const MediaFetchParams = z.object({ messageId: z.string().min(1) });
+const MediaFetchParams = z.object({ messageId: MessageId });
 
-const VoiceTranscribeParams = z.object({ messageId: z.string().min(1) });
+const VoiceTranscribeParams = z.object({ messageId: MessageId });
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Names the first field whose value dws's parser could mistake for an option
+ * (`--output=/somewhere` is one argv token), or undefined when all are safe.
+ * dwsArgv would throw on the same values; refusing first turns a crash into a
+ * polite ok:false that says which field was wrong.
+ */
+function unsafeField(fields: Array<[string, string | string[] | undefined]>): string | undefined {
+  for (const [name, value] of fields) {
+    if (value === undefined) continue;
+    const values = Array.isArray(value) ? value : [value];
+    if (!values.every(isSafeValue)) return name;
+  }
+  return undefined;
+}
+
+function unsafeFieldResponse(action: string, field: string): ToolResponse {
+  return {
+    ok: false,
+    message: `Refused ${action}: "${field}" starts with "-" or contains a NUL byte, which dws would read as an option, not as data.`,
+  };
+}
+
+/**
+ * Prose fields (a report body, a todo title, an event summary) may legitimately
+ * begin with "-" — a markdown bullet, an em-dash, "---". dws would read that as
+ * an option, so ADAPT rather than refuse: prepend a space, the same fix the
+ * reply path uses (src/dws textValue prepends a newline). Only prose gets this;
+ * structured fields (ids, timestamps, urls) never legitimately start with "-"
+ * and stay in the refuse path. A NUL is still refused via dwsArgv's own check.
+ */
+function proseValue(v: string): string {
+  return v.startsWith("-") ? ` ${v}` : v;
 }
 
 function zodMsg(error: z.ZodError): string {
@@ -95,7 +153,7 @@ function zodMsg(error: z.ZodError): string {
  * work-tool commands that have no DwsPort method (todo/calendar/report/voice). */
 async function runDws(dwsBin: string, argv: string[]): Promise<{ ok: boolean; stdout: string }> {
   return await new Promise((resolve) => {
-    const child = spawn(dwsBin, argv, { stdio: ["ignore", "pipe", "ignore"], env: process.env });
+    const child = spawn(dwsBin, argv, { stdio: ["ignore", "pipe", "ignore"], env: dwsChildEnv() });
     let stdout = "";
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
@@ -152,14 +210,19 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
   async function todoCreate(req: WorktoolRequest): Promise<ToolResponse> {
     const parsed = TodoCreateParams.safeParse(req.params);
     if (!parsed.success) return { ok: false, message: `Invalid todo_create params: ${zodMsg(parsed.error)}` };
+    const { title, dueIso, executorIds } = parsed.data;
+    const bad = unsafeField([
+      ["dueIso", dueIso],
+      ["executorIds", executorIds],
+    ]);
+    if (bad) return unsafeFieldResponse("todo_create", bad);
     if (!checkWriteBudget(req.conversationId)) {
       return { ok: false, message: "Write budget exceeded for this workspace this hour — try again later." };
     }
-    const { title, dueIso, executorIds } = parsed.data;
-    const argv = ["todo", "task", "create", "--subject", title];
-    if (dueIso) argv.push("--due-time", dueIso);
-    if (executorIds && executorIds.length > 0) argv.push("--executors", executorIds.join(","));
-    const res = await runDws(deps.cfg.dwsBin, argv);
+    const flags: Flag[] = [["--subject", proseValue(title)]];
+    if (dueIso) flags.push(["--due-time", dueIso]);
+    if (executorIds && executorIds.length > 0) flags.push(["--executors", executorIds.join(",")]);
+    const res = await runDws(deps.cfg.dwsBin, dwsArgv(["todo", "task", "create"], flags));
     if (!res.ok) return { ok: false, message: `Failed to create todo: ${res.stdout.trim()}` };
     return { ok: true, message: `Todo created: ${title}`, data: { stdout: res.stdout } };
   }
@@ -167,13 +230,23 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
   async function calendarCreate(req: WorktoolRequest): Promise<ToolResponse> {
     const parsed = CalendarCreateParams.safeParse(req.params);
     if (!parsed.success) return { ok: false, message: `Invalid calendar_create params: ${zodMsg(parsed.error)}` };
+    const { summary, startIso, endIso, attendeeIds } = parsed.data;
+    const bad = unsafeField([
+      ["startIso", startIso],
+      ["endIso", endIso],
+      ["attendeeIds", attendeeIds],
+    ]);
+    if (bad) return unsafeFieldResponse("calendar_create", bad);
     if (!checkWriteBudget(req.conversationId)) {
       return { ok: false, message: "Write budget exceeded for this workspace this hour — try again later." };
     }
-    const { summary, startIso, endIso, attendeeIds } = parsed.data;
-    const argv = ["calendar", "event", "create", "--summary", summary, "--start-time", startIso, "--end-time", endIso];
-    if (attendeeIds && attendeeIds.length > 0) argv.push("--attendees", attendeeIds.join(","));
-    const res = await runDws(deps.cfg.dwsBin, argv);
+    const flags: Flag[] = [
+      ["--summary", proseValue(summary)],
+      ["--start-time", startIso],
+      ["--end-time", endIso],
+    ];
+    if (attendeeIds && attendeeIds.length > 0) flags.push(["--attendees", attendeeIds.join(",")]);
+    const res = await runDws(deps.cfg.dwsBin, dwsArgv(["calendar", "event", "create"], flags));
     if (!res.ok) return { ok: false, message: `Failed to create calendar event: ${res.stdout.trim()}` };
     return { ok: true, message: `Calendar event created: ${summary}`, data: { stdout: res.stdout } };
   }
@@ -182,6 +255,14 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
     const parsed = DocReadParams.safeParse(req.params);
     if (!parsed.success) return { ok: false, message: `Invalid doc_read params: ${zodMsg(parsed.error)}` };
     const { url } = parsed.data;
+
+    // doc_read is an outbound fetch whose response is echoed back into chat.
+    // The transcript gate below constrains WHO chose the string, not WHERE it
+    // points — the attacker types the message, so the attacker picks the URL.
+    // Destination is therefore decided here, against config, first.
+    const host = checkDocHost(deps.cfg.docHosts, url);
+    if (!host.ok) return { ok: false, message: `doc_read refused: ${host.message}.` };
+    if (!isSafeValue(url)) return unsafeFieldResponse("doc_read", "url");
 
     const tail = await workspaces.transcriptTail(req.conversationId, 2000);
     if (!tail.some((line) => line.includes(url))) {
@@ -194,7 +275,7 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
     const hash = createHash("sha256").update(url).digest("hex").slice(0, 12);
     const mediaDir = wsPaths(meta.dir).media;
     await mkdir(mediaDir, { recursive: true });
-    const destFile = `${mediaDir}/doc-${hash}.md`;
+    const destFile = resolveInside(mediaDir, `doc-${hash}.md`);
 
     await deps.dws.exportDoc(url, destFile);
     const content = await readFile(destFile, "utf8");
@@ -204,14 +285,16 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
   async function reportCreate(req: WorktoolRequest): Promise<ToolResponse> {
     const parsed = ReportCreateParams.safeParse(req.params);
     if (!parsed.success) return { ok: false, message: `Invalid report_create params: ${zodMsg(parsed.error)}` };
+    const { content, templateName } = parsed.data;
+    const bad = unsafeField([["templateName", templateName]]);
+    if (bad) return unsafeFieldResponse("report_create", bad);
     if (!checkWriteBudget(req.conversationId)) {
       return { ok: false, message: "Write budget exceeded for this workspace this hour — try again later." };
     }
-    const { content, templateName } = parsed.data;
-    const argv = ["report", "create", "--content", content];
-    if (templateName) argv.push("--template", templateName);
+    const flags: Flag[] = [["--content", proseValue(content)]];
+    if (templateName) flags.push(["--template", templateName]);
     try {
-      const res = await runDws(deps.cfg.dwsBin, argv);
+      const res = await runDws(deps.cfg.dwsBin, dwsArgv(["report", "create"], flags));
       if (!res.ok) return { ok: false, message: "Report submission failed (best-effort)." };
       return { ok: true, message: "Report submitted.", data: { stdout: res.stdout } };
     } catch (err) {
@@ -239,7 +322,17 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
     const excerpts: { file: string; text: string }[] = [];
     const refusals: string[] = [];
 
-    for (const file of downloaded) {
+    for (const downloadedPath of downloaded) {
+      // Containment before anything touches the disk. A name chosen by the
+      // uploader decides this path, and the refusal branches below delete —
+      // an escaping path must never be read and never be removed either.
+      let file: string;
+      try {
+        file = resolveInside(mediaDir, downloadedPath);
+      } catch {
+        refusals.push(`${downloadedPath}: outside this workspace's media dir`);
+        continue;
+      }
       const ext = extname(file).toLowerCase();
       if (!ALLOWED_MEDIA_EXT.has(ext)) {
         await rm(file, { force: true });
@@ -291,7 +384,12 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
             mediaDir,
           );
           const first = files[0];
-          if (first) await runDws(deps.cfg.dwsBin, ["minutes", "upload", "--file", first]);
+          // Same containment rule as media_fetch: only a file inside this
+          // workspace's media dir may be handed to dws.
+          if (first) {
+            const file = resolveInside(mediaDir, first);
+            await runDws(deps.cfg.dwsBin, dwsArgv(["minutes", "upload"], [["--file", file]]));
+          }
         }
       } catch {
         // Expected: the minutes-bridge is an unverified spike. Fall through to
@@ -303,6 +401,22 @@ export function createWorktools(deps: WorktoolsDeps): Worktools {
 
   async function execute(req: WorktoolRequest): Promise<ToolResponse> {
     try {
+      // Capability gate: does this workspace's expert have this action at all?
+      // Runs first, so a refusal costs no write budget and spawns no dws. The
+      // permission tier (who may call it) is a separate check in src/api.
+      // voice_transcribe is exempt: no expert profile lists it, so gating it
+      // would delete the polite fallback and the DOUSHABAO_VOICE_SPIKE bridge
+      // (contract gap — see final report).
+      if (req.action !== "voice_transcribe") {
+        const meta = await workspaces.get(req.conversationId);
+        if (!expertAllowsAction(meta?.expert, req.action)) {
+          const expert = meta?.expert ?? "general";
+          return {
+            ok: false,
+            message: `Action "${req.action}" is not available to the "${expert}" expert in this workspace.`,
+          };
+        }
+      }
       switch (req.action) {
         case "todo_create":
           return await todoCreate(req);

@@ -195,4 +195,40 @@ DOUSHABAO_ROOT="$PWD" node src/index.ts
 
 Watch `var/daemon.log` (or stdout, if run in a foreground terminal) for the
 startup banner. `SIGINT`/`SIGTERM` trigger a graceful stop (dws consumers
-stop, cron stops, the HTTP API stops, then exit).
+stop, cron stops, the HTTP API stops, a final workspace snapshot is committed
+and pushed, then exit).
+
+## 9. Versioning the workspace tree as a git repo (optional)
+
+The workspace tree — one directory per group chat, holding transcripts,
+memory, knowledge base, jobs and downloaded attachments — can be its own git
+repo, so you get history, rollback, backup and portability.
+
+**Point it at a dedicated path, outside this checkout**, so `git pull` on the
+code never touches your data:
+
+```sh
+export DOUSHABAO_WORKSPACES="$HOME/doushabao-workspaces"
+```
+
+Then enable it in `config/doushabao.json`:
+
+```json
+"workspacesGit": { "enabled": true, "remote": "git@your-internal-host:you/doushabao-workspaces.git" }
+```
+
+The daemon commits coalesced snapshots on a timer (default every 20s, **never
+per message**) and pushes to `remote` on a slower timer (default every 5min),
+both off the message path. A commit and push also run on shutdown.
+
+> **The remote MUST be private.** This tree contains your colleagues' full
+> chat history and every attachment they sent. It is the most sensitive data
+> the system holds. A public remote — or a private one shared too widely — is
+> a serious leak. If in doubt, leave `remote` empty: you still get local
+> history and rollback, and nothing ever leaves the machine.
+
+Push runs as the dedicated account, so **that account needs git credentials**
+for the remote — an SSH key or a credential helper, set up the usual way.
+Push failures are logged and retried, never fatal. The daemon writes a
+`.gitignore` into the repo that keeps the copied `.pi/` code and OS cruft out
+of history; the data files are what get versioned.

@@ -15,5 +15,5 @@
     "verbatimModuleSyntax": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["node_modules", "boilerplates"]
+  "exclude": ["node_modules", "experts"]
 }

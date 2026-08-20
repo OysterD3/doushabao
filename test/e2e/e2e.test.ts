@@ -67,6 +67,28 @@ async function readJsonlLines(path: string): Promise<Record<string, unknown>[]> 
 interface OutboxRecord {
   ts: number;
   argv: string[];
+  /** Set by fake-dws for +messages-send: the id the message was posted as. */
+  messageId?: string;
+}
+
+/** The id of the options message a pending question was posted as. A reaction
+ * only answers the pending it was posted on, so the test must react to the
+ * real id rather than to one it made up.
+ *
+ * Waits: the pi run finishes before the reply leaves the paced send queue, so
+ * the pi log growing does NOT mean the options message is in the outbox yet. */
+async function postedOptionsMessageId(root: string, group: string, timeoutMs = 15_000): Promise<string> {
+  let found: string | undefined;
+  await waitFor(async () => {
+    const options = findSends(await readOutbox(root), { group }).filter((r) => {
+      const i = r.argv.indexOf("--text");
+      const text = i === -1 ? "" : r.argv[i + 1] ?? "";
+      return text.includes("1") && text.includes("2");
+    });
+    found = options.at(-1)?.messageId;
+    return found !== undefined;
+  }, timeoutMs);
+  return found!;
 }
 interface PiLogRecord {
   ts: number;
@@ -226,12 +248,43 @@ async function writeScenario(root: string): Promise<void> {
   await writeFile(join(root, "scenario.json"), JSON.stringify(scenario, null, 2));
 }
 
-/** paths.boilerplates is ROOT-relative (see src/shared/paths.ts), so the
- * sandbox needs its own copy of the real project's boilerplate templates. */
-async function copyBoilerplates(root: string): Promise<void> {
-  const src = join(PROJECT_ROOT, "boilerplates");
+/** paths.experts is ROOT-relative (see src/shared/paths.ts), so the
+ * sandbox needs its own copy of the real project's expert templates. */
+async function copyExperts(root: string): Promise<void> {
+  const src = join(PROJECT_ROOT, "experts");
   if (!existsSync(src)) return;
-  await cp(src, join(root, "boilerplates"), { recursive: true });
+  await cp(src, join(root, "experts"), { recursive: true });
+}
+
+/** The conversation scenario 5 schedules cron in. `schedule_job` only exists
+ * in the project + dev-mgmt expert profiles, and first contact always creates
+ * a "general" workspace, so this room is seeded on disk instead. */
+const CRON_CID = "user-sched";
+
+/** Materializes one workspace exactly as the registry's getOrCreate would,
+ * but with an expert of our choosing. Runs before the daemon starts, because
+ * the registry scans workspaces/ once at construction. */
+async function seedWorkspace(root: string, conversationId: string, expert: string): Promise<void> {
+  // Same directory name the registry's slug() would pick for this id.
+  const dir = join(root, "workspaces", conversationId);
+  const template = join(root, "experts", expert);
+  await mkdir(join(dir, ".pi", "extensions"), { recursive: true });
+  for (const sub of ["jobs", "kb", "media", "memory"]) await mkdir(join(dir, sub), { recursive: true });
+  await cp(join(template, "AGENTS.md"), join(dir, "AGENTS.md"));
+  await cp(join(template, ".pi", "settings.json"), join(dir, ".pi", "settings.json"));
+  await cp(join(root, "experts", "_shared", "extensions", "doushabao.ts"), join(dir, ".pi", "extensions", "doushabao.ts"));
+  const meta = {
+    conversationId,
+    conversationType: "dm",
+    dir,
+    expert,
+    editors: [],
+    multimodal: false,
+    digestsEnabled: false,
+    createdAt: Date.now(),
+    greeted: true,
+  };
+  await writeFile(join(dir, "workspace.json"), JSON.stringify(meta, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +309,8 @@ beforeAll(async () => {
   port = await freePort();
   await writeConfig(root, port);
   await writeScenario(root);
-  await copyBoilerplates(root);
+  await copyExperts(root);
+  await seedWorkspace(root, CRON_CID, "project");
   daemon = spawnDaemon(root, port);
   await withDebug(() => waitForHealth(port, 20_000));
 });
@@ -369,10 +423,25 @@ test("scenario 3: ask/approve round-trip", () =>
     }, 15_000);
 
     const piAfterAsk = (await readPiLog(root)).length;
+    const optionsMessageId = await postedOptionsMessageId(root, "group3");
+    
 
+    // A reaction on some OTHER message must not answer the pending, even from
+    // the right person — the approval is bound to the message it was posted on.
     await pushEvent(root, "user_im_message_reaction_group", {
       conversation_id: "group3",
-      message_id: "options-msg-group3",
+      message_id: `${optionsMessageId}-not-this-one`,
+      operator_open_dingtalk_id: "userC",
+      reaction_name: "like",
+      operation_type: "add",
+    });
+    await sleep(1_500);
+    expect((await readPiLog(root)).length).toBe(piAfterAsk);
+
+    // The same reaction on the real options message does answer it.
+    await pushEvent(root, "user_im_message_reaction_group", {
+      conversation_id: "group3",
+      message_id: optionsMessageId,
       operator_open_dingtalk_id: "userC",
       reaction_name: "like",
       operation_type: "add",
@@ -401,10 +470,13 @@ test("scenario 4: unauthorized reaction ignored", () =>
 
     await waitFor(async () => (await readPiLog(root)).length >= piBefore + 1, 15_000);
     const piAfterAsk = (await readPiLog(root)).length;
+    const optionsMessageId = await postedOptionsMessageId(root, "group4");
+    
 
+    // Right message, wrong person: the reaction must still be ignored.
     await pushEvent(root, "user_im_message_reaction_group", {
       conversation_id: "group4",
-      message_id: "options-msg-group4",
+      message_id: optionsMessageId,
       operator_open_dingtalk_id: "stranger",
       reaction_name: "like",
       operation_type: "add",
@@ -424,20 +496,31 @@ test("scenario 5: cron fires", () =>
     const token = (await readFile(join(root, "var", "ipc-token"), "utf8")).trim();
     const piBefore = (await readPiLog(root)).length;
 
-    const res = await fetch(`http://127.0.0.1:${port}/tool`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        tool: "schedule_job",
-        conversationId: "userA",
-        senderId: "adminU",
-        cronExpr: "* * * * * *",
-        description: "e2e cron ping",
-        prompt: "cron ping",
-      }),
-    });
-    expect(res.ok).toBe(true);
-    const body = (await res.json()) as { ok: boolean };
+    async function schedule(conversationId: string): Promise<{ ok: boolean; message: string }> {
+      const res = await fetch(`http://127.0.0.1:${port}/tool`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          tool: "schedule_job",
+          conversationId,
+          senderId: "adminU",
+          cronExpr: "* * * * * *",
+          description: "e2e cron ping",
+          prompt: "cron ping",
+        }),
+      });
+      expect(res.ok).toBe(true);
+      return (await res.json()) as { ok: boolean; message: string };
+    }
+
+    // userA is a "general" workspace (scenario 1 created it on first contact),
+    // and schedule_job is not in that expert's profile — refused even for an
+    // admin, because capability belongs to the room, not the caller.
+    const refused = await schedule("userA");
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain("not available");
+
+    const body = await schedule(CRON_CID);
     expect(body.ok).toBe(true);
 
     await waitFor(async () => {
@@ -446,7 +529,7 @@ test("scenario 5: cron fires", () =>
     }, 6_000);
 
     await waitFor(async () => {
-      return findSends(await readOutbox(root), { dm: "userA", textIncludes: "cron says hi" }).length > 0;
+      return findSends(await readOutbox(root), { dm: CRON_CID, textIncludes: "cron says hi" }).length > 0;
     }, 6_000);
   }));
 

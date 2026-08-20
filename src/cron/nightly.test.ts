@@ -12,7 +12,7 @@ function tmpWorkspace(): WorkspaceMeta {
     conversationId: "conv-1",
     conversationType: "group",
     dir,
-    boilerplate: "general",
+    expert: "general",
     editors: [],
     multimodal: false,
     digestsEnabled: false,

@@ -15,7 +15,7 @@ process.env.DOUSHABAO_ROOT = root;
 
 const { createTasks } = await import("./index.ts");
 const { paths } = await import("../shared/paths.ts");
-const { ConfigSchema } = await import("../shared/types.ts");
+const { ConfigSchema, expertToolNames } = await import("../shared/types.ts");
 
 type TasksDeps = Parameters<typeof createTasks>[0];
 type PiRunnerPort = TasksDeps["runner"];
@@ -213,6 +213,32 @@ describe("model selection", () => {
       actual.push({ label: c.label, model: await modelSeenFor(c.models, c.ws) });
     }
     expect(actual).toEqual(cases.map((c) => ({ label: c.label, model: c.want })));
+  });
+});
+
+describe("expert tool allowlist", () => {
+  test("the worker run gets the owning workspace's expert tool names", async () => {
+    const seen: RunOpts[] = [];
+    const { enqueueRun } = collectingEnqueue();
+    const tasks = createTasks({
+      cfg,
+      runner: {
+        run: async (opts) => {
+          seen.push(opts);
+          return { text: "ok", ok: true };
+        },
+      },
+      workspaces: { get: (_cid: string) => ({ dir: "/fake/ws", expert: "qa-cs" as const }) },
+      enqueueRun,
+      ipc: fakeIpc(),
+    });
+    await tasks.create("conv-expert", "user-e", "task in a qa-cs workspace");
+    await waitUntil(() => tasks.list("conv-expert")[0]?.status === "announced");
+
+    expect(seen[0]!.tools).toEqual(expertToolNames("qa-cs"));
+    // anchor: qa-cs grants the kb tools, and grants no job scheduling
+    expect(seen[0]!.tools).toContain("doushabao_kb_save");
+    expect(seen[0]!.tools).not.toContain("doushabao_schedule_job");
   });
 });
 

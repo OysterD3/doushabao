@@ -37,10 +37,22 @@ export const ConfigSchema = z.object({
     .prefault({}),
   http: z
     .object({
-      host: z.string().default("127.0.0.1"),
+      /** Loopback ONLY, and enforced rather than merely defaulted: the /tool
+       * endpoint is the agent's whole authority surface. A config typo of
+       * "0.0.0.0" would put it on the LAN behind nothing but a bearer token. */
+      host: z
+        .string()
+        .default("127.0.0.1")
+        .refine((h) => ["127.0.0.1", "::1", "localhost"].includes(h), {
+          message: 'http.host must be loopback ("127.0.0.1", "::1" or "localhost") — the tool API is never exposed off-box',
+        }),
       port: z.number().int().default(8787),
     })
     .prefault({}),
+  /** Hosts `doc_read` may fetch from. An empty list means "no doc reading".
+   * doc_read hands a URL to the dws binary, so an unconstrained host here is
+   * an outbound fetch to anywhere, with the response echoed back into chat. */
+  docHosts: z.array(z.string()).default(["alidocs.dingtalk.com", "docs.dingtalk.com"]),
   pacing: z
     .object({
       /** Minimum ms between outbound sends (global queue). */
@@ -88,6 +100,25 @@ export const ConfigSchema = z.object({
       hour: z.number().int().default(3),
     })
     .prefault({}),
+  /** Version the workspace tree (one dir per group chat) as its own git repo.
+   * The daemon commits coalesced snapshots on a timer — NEVER per message —
+   * off the message path, and pushes to `remote` on a slower timer. Commit
+   * messages are templated, never chat content. */
+  workspacesGit: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Private remote to push to. Empty = commit locally, never push.
+       * MUST be a private repo: the tree contains full chat transcripts and
+       * downloaded attachments. */
+      remote: z.string().default(""),
+      /** How often to check for changes and commit them, in ms. */
+      commitIntervalMs: z.number().int().default(20_000),
+      /** How often to push accumulated commits, in ms. */
+      pushIntervalMs: z.number().int().default(300_000),
+      authorName: z.string().default("doushabao"),
+      authorEmail: z.string().default("doushabao@localhost"),
+    })
+    .prefault({}),
 });
 export type Config = z.infer<typeof ConfigSchema>;
 
@@ -130,13 +161,15 @@ export type InboundEvent = InboundMessage | InboundReaction;
 // Workspaces
 // ---------------------------------------------------------------------------
 
-export type Boilerplate = "general" | "qa-cs" | "project" | "dev-mgmt";
+export type Expert = "general" | "qa-cs" | "project" | "dev-mgmt" | "debug";
+
+export const EXPERTS: readonly Expert[] = ["general", "qa-cs", "project", "dev-mgmt", "debug"];
 
 export interface WorkspaceMeta {
   conversationId: string;
   conversationType: ConversationType;
   dir: string; // absolute path under workspaces/
-  boilerplate: Boilerplate;
+  expert: Expert;
   title?: string;
   /** Per-workspace editors: may inject KB answers, manage this workspace's cron. */
   editors: string[];
@@ -273,7 +306,7 @@ export type ToolRequest =
       action: string;
       params: Record<string, unknown>;
     }
-  | { tool: "set_workspace"; conversationId: string; senderId: string; patch: Partial<Pick<WorkspaceMeta, "boilerplate" | "editors" | "owner" | "multimodal" | "digestsEnabled" | "modelOverride">> }
+  | { tool: "set_workspace"; conversationId: string; senderId: string; patch: Partial<Pick<WorkspaceMeta, "expert" | "editors" | "owner" | "multimodal" | "digestsEnabled" | "modelOverride">> }
   | { tool: "memory_admin"; conversationId: string; senderId: string; op: "list" | "read" | "write" | "delete"; name?: string; content?: string }
   | { tool: "ops"; conversationId: string; senderId: string; op: "status" | "spend" | "tasks" | "retry_task" | "pause_workspace" | "resume_workspace"; target?: string };
 
@@ -282,6 +315,107 @@ export interface ToolResponse {
   /** Human-readable result the agent can relay. */
   message: string;
   data?: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Expert profiles — WHICH tools exist in a workspace.
+//
+// This is capability, not authority. The permission tier (admins / editors /
+// requester) is enforced separately in src/api and applies on top: a tool can
+// be present in the profile and still be refused to the caller. Both checks
+// run, because they answer different questions — "does this room have this
+// tool at all" vs "may you use it".
+//
+// Enforced in two places on purpose:
+//  1. src/pi passes `-t <names>` so the model never SEES an out-of-profile
+//     tool. That is the real boundary; it also shortens every prompt.
+//  2. src/api re-checks each request against the workspace's expert, so the
+//     audit log is honest even if something reached the socket another way.
+// ---------------------------------------------------------------------------
+
+export type ToolVerb = ToolRequest["tool"];
+
+/** IPC verb → the pi tool name the workspace extension registers for it. */
+export const TOOL_NAMES: Record<ToolVerb, string> = {
+  send_message: "doushabao_send",
+  ask_user: "doushabao_ask",
+  delegate_async: "doushabao_delegate",
+  schedule_job: "doushabao_schedule_job",
+  cancel_job: "doushabao_cancel_job",
+  list_jobs: "doushabao_list_jobs",
+  kb_save: "doushabao_kb_save",
+  kb_promote: "doushabao_kb_promote",
+  kb_revoke: "doushabao_kb_revoke",
+  flag_unanswered: "doushabao_flag_unanswered",
+  escalate: "doushabao_escalate",
+  worktool: "doushabao_worktool",
+  set_workspace: "doushabao_set_workspace",
+  memory_admin: "doushabao_memory",
+  ops: "doushabao_ops",
+};
+
+export interface ExpertProfile {
+  tools: ToolVerb[];
+  /** Curated `worktool` actions this expert may run. Empty = none, and then
+   * `worktool` should not appear in `tools` either. */
+  worktools: string[];
+}
+
+/** The safety valves every expert keeps, whatever else it is for: it must
+ * always be able to answer, ask a human, escalate, and admit a gap. */
+// Safety valves + management. `set_workspace` and `ops` are here, in EVERY
+// profile, on purpose: they are how a room is reconfigured or repaired, so
+// gating them by the room's own expert would deadlock — every room is created
+// `general`, and set_workspace is the only way to change that. They are
+// AUTHORITY operations, governed by the admin/editor tier check in src/api,
+// not by the capability profile. The profile still governs the persona tools
+// below (delegate, kb, schedule, worktool actions).
+const BASE_TOOLS: ToolVerb[] = ["send_message", "ask_user", "escalate", "flag_unanswered", "list_jobs", "memory_admin", "set_workspace", "ops"];
+/** Read-only DingTalk actions; safe enough to be near-universal. */
+const READ_WORKTOOLS = ["doc_read", "media_fetch"];
+
+export const EXPERT_PROFILES: Record<Expert, ExpertProfile> = {
+  general: {
+    tools: [...BASE_TOOLS, "delegate_async", "worktool"],
+    worktools: [...READ_WORKTOOLS],
+  },
+  "qa-cs": {
+    tools: [...BASE_TOOLS, "delegate_async", "worktool", "kb_save", "kb_promote", "kb_revoke"],
+    worktools: [...READ_WORKTOOLS],
+  },
+  project: {
+    tools: [...BASE_TOOLS, "delegate_async", "worktool", "schedule_job", "cancel_job"],
+    worktools: [...READ_WORKTOOLS, "todo_create", "calendar_create", "report_create"],
+  },
+  "dev-mgmt": {
+    tools: [...BASE_TOOLS, "delegate_async", "worktool", "schedule_job", "cancel_job"],
+    worktools: [...READ_WORKTOOLS, "todo_create", "calendar_create", "report_create"],
+  },
+  // Diagnosis must not have side effects: no kb writes, no todos, no invites,
+  // no delegated work — read-only over the ops/status surface.
+  debug: {
+    tools: [...BASE_TOOLS],
+    worktools: [],
+  },
+};
+
+/** Falls back to `general` for anything unrecognised, because `expert` is read
+ * from workspace.json on disk and may predate a rename. */
+export function expertProfile(expert: Expert | string | undefined): ExpertProfile {
+  return EXPERT_PROFILES[expert as Expert] ?? EXPERT_PROFILES.general;
+}
+
+/** pi tool names for this expert — pass straight to `pi -t <names>`. */
+export function expertToolNames(expert: Expert | string | undefined): string[] {
+  return expertProfile(expert).tools.map((verb) => TOOL_NAMES[verb]);
+}
+
+export function expertAllowsTool(expert: Expert | string | undefined, verb: ToolVerb): boolean {
+  return expertProfile(expert).tools.includes(verb);
+}
+
+export function expertAllowsAction(expert: Expert | string | undefined, action: string): boolean {
+  return expertProfile(expert).worktools.includes(action);
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +452,12 @@ export interface PiRunnerPort {
     model?: string;
     env: Record<string, string>;
     timeoutMs?: number;
+    /** pi tool names (see TOOL_NAMES) this run may use. REQUIRED and
+     * fail-closed: a non-empty list becomes `-t a,b,c`; an empty list becomes
+     * `-nt` (no tools at all). Pass `expertToolNames(meta.expert)` for a normal
+     * run, or `[]` for a deliberately tool-less one (e.g. nightly distillation)
+     * — never omit it, so "no value" can never mean "all tools". */
+    tools: string[];
   }): Promise<{ text: string; ok: boolean; error?: string }>;
 }
 

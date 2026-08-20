@@ -4,10 +4,20 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { assertUuid, resolveInside } from "../shared/paths.ts";
 import type { KbEntry } from "../shared/types.ts";
 
+/**
+ * The one place a KB id becomes a filename — read, write and delete all go
+ * through here, so this is where both containment layers belong.
+ *
+ * A KB id is always a randomUUID(), so anything else is refused outright; the
+ * resolveInside call then contains the result no matter what a future caller
+ * (or a future id shape) lets through. The two checks fail differently on
+ * purpose: `../../../../.pi/agent/auth` is neither a uuid nor inside `dir`.
+ */
 export function kbEntryFile(dir: string, id: string): string {
-  return join(dir, `${id}.json`);
+  return resolveInside(dir, `${assertUuid("kb entry", id)}.json`);
 }
 
 /** Atomic write (tmp-file-in-same-dir + rename). */

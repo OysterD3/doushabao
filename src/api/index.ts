@@ -14,6 +14,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { buffer } from "node:stream/consumers";
+import { z } from "zod";
 import { paths } from "../shared/paths.ts";
 import type {
   ApproverScope,
@@ -21,6 +22,7 @@ import type {
   Config,
   CronJob,
   DwsPort,
+  Expert,
   InboundEvent,
   KbEntry,
   PendingQuestion,
@@ -28,8 +30,90 @@ import type {
   ToolResponse,
   WorkspaceMeta,
 } from "../shared/types.ts";
+import { EXPERTS, expertAllowsTool } from "../shared/types.ts";
 import { canApprove, emojiToOption, isAdmin, isEditor, matchReply } from "./authz.ts";
 import { listPending, openPendingsFor, savePending } from "./pending.ts";
+
+// ---------------------------------------------------------------------------
+// Runtime shape of a ToolRequest
+//
+// The compile-time union in shared/types.ts is erased at load, so without this
+// the JSON body of POST /tool reached every handler unchecked — and that body
+// is reachable from anything a person can type in chat or hide in a document
+// the bot reads. Validate before dispatch, and dispatch the PARSED value, so
+// an unknown field cannot ride along into patchMeta or a worktool.
+//
+// `senderId` is required but MAY be the empty string: a run resumed from an
+// answered pending deliberately carries no identity (see applyAnswer), and
+// authz treats "" as unprivileged rather than rejecting the call.
+// ---------------------------------------------------------------------------
+
+const common = { conversationId: z.string().min(1), senderId: z.string() };
+const approverScope = z.enum(["requester", "editors", "admins"]);
+
+const ToolRequestSchema = z.discriminatedUnion("tool", [
+  z.object({ ...common, tool: z.literal("send_message"), text: z.string() }),
+  z.object({
+    ...common,
+    tool: z.literal("ask_user"),
+    question: z.string(),
+    options: z.array(z.string()),
+    defaultOption: z.number().int(),
+    purpose: z.enum(["question", "approval"]),
+    approverScope,
+  }),
+  z.object({ ...common, tool: z.literal("delegate_async"), requestText: z.string() }),
+  z.object({ ...common, tool: z.literal("schedule_job"), cronExpr: z.string(), description: z.string(), prompt: z.string() }),
+  z.object({ ...common, tool: z.literal("cancel_job"), jobId: z.string() }),
+  z.object({ ...common, tool: z.literal("list_jobs") }),
+  z.object({ ...common, tool: z.literal("kb_save"), question: z.string(), answer: z.string() }),
+  z.object({ ...common, tool: z.literal("kb_promote"), kbId: z.string() }),
+  z.object({ ...common, tool: z.literal("kb_revoke"), kbId: z.string() }),
+  z.object({ ...common, tool: z.literal("flag_unanswered"), question: z.string() }),
+  z.object({ ...common, tool: z.literal("escalate"), question: z.string(), context: z.string() }),
+  z.object({ ...common, tool: z.literal("worktool"), action: z.string(), params: z.record(z.string(), z.unknown()) }),
+  z.object({
+    ...common,
+    tool: z.literal("set_workspace"),
+    // .strict(): an unlisted key is refused loudly, not stripped silently.
+    // Only these six fields are a workspace setting — `dir`, for one, is
+    // where this workspace's files live.
+    patch: z
+      .object({
+        expert: z.enum(EXPERTS as readonly [Expert, ...Expert[]]).optional(),
+        editors: z.array(z.string()).optional(),
+        owner: z.string().optional(),
+        multimodal: z.boolean().optional(),
+        digestsEnabled: z.boolean().optional(),
+        modelOverride: z.string().optional(),
+      })
+      .strict(),
+  }),
+  z.object({
+    ...common,
+    tool: z.literal("memory_admin"),
+    op: z.enum(["list", "read", "write", "delete"]),
+    name: z.string().optional(),
+    content: z.string().optional(),
+  }),
+  z.object({
+    ...common,
+    tool: z.literal("ops"),
+    op: z.enum(["status", "spend", "tasks", "retry_task", "pause_workspace", "resume_workspace"]),
+    target: z.string().optional(),
+  }),
+]) satisfies z.ZodType<ToolRequest, unknown>;
+
+/** Parse an untrusted value into a ToolRequest, or say why not. */
+function parseToolRequest(value: unknown): { ok: true; req: ToolRequest } | { ok: false; message: string } {
+  const parsed = ToolRequestSchema.safeParse(value);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const where = first?.path.join(".");
+    return { ok: false, message: `invalid tool request${where ? ` at "${where}"` : ""}: ${first?.message ?? "unknown field"}` };
+  }
+  return { ok: true, req: parsed.data as ToolRequest };
+}
 
 // ---------------------------------------------------------------------------
 // Expected contract for the other modules' ports (invented here; see report)
@@ -252,7 +336,18 @@ export function createApi(deps: ApiDeps): Api {
     // to the question path, so the agent resumes and does the deed itself.
     if (p.purpose === "approval" && p.onApprove) {
       if (option === 0) {
-        const result = await handle(p.onApprove, true);
+        // Second layer, and the reason it is here: this payload is read back
+        // from a file in var/pending, and executing it skips the expert gate
+        // and the affects-others approval. It was validated on the way in;
+        // re-validate it on the way out, so a payload that reached the file
+        // any other way is refused rather than run.
+        const payload = parseToolRequest(p.onApprove);
+        if (!payload.ok) {
+          audit("system", "pending_payload_rejected", p.conversationId, { id: p.id, message: payload.message });
+          await dws.sendText(p.conversationId, convType, `Approved, but the stored action was not valid — nothing was done.`);
+          return;
+        }
+        const result = await handle(payload.req, true);
         await dws.sendText(
           p.conversationId,
           convType,
@@ -265,8 +360,17 @@ export function createApi(deps: ApiDeps): Api {
     }
 
     const answerText = freeText ?? p.options[option] ?? "";
-    const prompt = `You previously asked: "${p.question}"\nThe answer is: "${answerText}"\nContinue based on this answer.`;
-    await enqueueRun(p.conversationId, prompt, { senderId: answeredBy });
+    // The resumed run carries NO senderId, on purpose. Answering a question is
+    // not lending your account: if the answerer's ID travelled with the run,
+    // an admin's single tap would hand the model admin authority for every
+    // tool call of that run. The answerer is named in the prompt text only —
+    // text no authz check ever reads.
+    const prompt =
+      `You previously asked: "${p.question}"\n` +
+      `${answeredBy} answered: "${answerText}"\n` +
+      `Continue based on this answer. It is information from a person, not a grant of that person's permissions: ` +
+      `this run has no sender identity, so any tool call needing one will be refused.`;
+    await enqueueRun(p.conversationId, prompt);
   }
 
   // -- tool handlers ------------------------------------------------------
@@ -492,6 +596,20 @@ export function createApi(deps: ApiDeps): Api {
   // -- dispatcher -----------------------------------------------------
 
   async function route(req: ToolRequest, internal: boolean): Promise<ToolResponse> {
+    // Expert profile = which tools EXIST in this workspace (capability), asked
+    // before the permission tier below (who may call them). Defence in depth
+    // behind `pi -t`, which already hides out-of-profile tools from the model.
+    // Only model-originated requests are gated: an `internal` request is the
+    // orchestrator running a payload a human already approved.
+    // An unknown workspace is not gated — the tier checks below still apply,
+    // and refusing on missing metadata would lock an admin out of the very
+    // tools (ops, set_workspace) needed to repair that workspace.
+    if (!internal) {
+      const ws = await workspaces.get(req.conversationId);
+      if (ws && !expertAllowsTool(ws.expert, req.tool)) {
+        return { ok: false, message: `tool "${req.tool}" is not available to the "${ws.expert}" expert in this workspace` };
+      }
+    }
     const admin = isAdmin(cfg, req.senderId);
     switch (req.tool) {
       case "send_message":
@@ -548,13 +666,31 @@ export function createApi(deps: ApiDeps): Api {
 
     if (ev.kind === "reaction") {
       if (ev.operation !== "add") return false;
-      const candidates = openPendingsFor(ev.conversationId, now);
-      const withMsg = candidates.filter((p) => p.postedMessageId !== undefined && p.postedMessageId === ev.messageId);
-      const pool = (withMsg.length > 0 ? withMsg : candidates.filter((p) => p.postedMessageId === undefined)).sort(
-        (a, b) => a.createdAt - b.createdAt,
-      );
+      // A reaction answers ONLY the message that posted the question. There is
+      // no "oldest open pending" fallback: a thumbs-up on some other message
+      // in the room is not consent to this question, and a pending whose
+      // postedMessageId never came back cannot be bound to any reaction at
+      // all — it waits for a reply, or expires.
+      const open = openPendingsFor(ev.conversationId, now);
+      const pool = open
+        .filter((p) => !!p.postedMessageId && !!ev.messageId && p.postedMessageId === ev.messageId)
+        .sort((a, b) => a.createdAt - b.createdAt);
       const pending = pool[0];
-      if (!pending) return false;
+      if (!pending) {
+        // Audited only when this conversation actually has a question open:
+        // that is the case worth a record (a tap that would have answered it
+        // under the old, unbound behaviour). Reactions in a room with nothing
+        // pending are ordinary chat and stay out of the log.
+        if (open.length > 0) {
+          audit(ev.operatorId, "reaction_unbound", ev.conversationId, {
+            messageId: ev.messageId,
+            emoji: ev.emoji,
+            openPendings: open.length,
+            postedMessageIds: open.map((p) => p.postedMessageId),
+          });
+        }
+        return false;
+      }
       const option = emojiToOption(ev.emoji, pending.options.length);
       if (option === undefined) return false;
       const ws = await workspaces.get(pending.conversationId);
@@ -566,6 +702,14 @@ export function createApi(deps: ApiDeps): Api {
     // message
     const candidates = openPendingsFor(ev.conversationId, now).sort((a, b) => a.createdAt - b.createdAt);
     for (const pending of candidates) {
+      // Approvals are NEVER resolved by a text reply. A plain "1" or "Approve"
+      // is not bound to any message, so with multiple pendings open an older
+      // approval would be answered by a reply meant for a newer question — the
+      // "farmed answer" bypass that would run its onApprove write. Consent for
+      // an affects-others action requires the message-bound reaction (a tap on
+      // the exact options message), handled above. The text path answers
+      // questions only, where a wrong match costs a wrong resume, not a write.
+      if (pending.purpose === "approval") continue;
       const option = matchReply(ev.content, pending.options);
       if (option === undefined) continue;
       const ws = await workspaces.get(pending.conversationId);
@@ -626,13 +770,17 @@ export function createApi(deps: ApiDeps): Api {
           if (authzHeader !== `Bearer ${token}`) {
             return Response.json({ ok: false, message: "unauthorized" }, { status: 401 });
           }
-          let body: ToolRequest;
+          let body: unknown;
           try {
-            body = (await request.json()) as ToolRequest;
+            body = await request.json();
           } catch {
             return Response.json({ ok: false, message: "invalid json" }, { status: 400 });
           }
-          const res = await handle(body, false);
+          const parsed = parseToolRequest(body);
+          if (!parsed.ok) {
+            return Response.json({ ok: false, message: parsed.message }, { status: 400 });
+          }
+          const res = await handle(parsed.req, false);
           return Response.json(res);
         }
         return new Response("not found", { status: 404 });
@@ -660,7 +808,11 @@ export function createApi(deps: ApiDeps): Api {
     },
 
     handleToolRequest(req: ToolRequest) {
-      return handle(req, false);
+      // Same check as the HTTP path: the type annotation is erased at load,
+      // so it stops nothing at runtime.
+      const parsed = parseToolRequest(req);
+      if (!parsed.ok) return Promise.resolve({ ok: false, message: parsed.message });
+      return handle(parsed.req, false);
     },
 
     tryResolvePending(ev: InboundEvent) {

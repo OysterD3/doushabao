@@ -6,6 +6,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import {
   dailySessionId,
+  expertToolNames,
   type Config,
   type ConversationType,
   type DwsPort,
@@ -33,7 +34,7 @@ export interface WorkspaceTranscriptEntry {
  * final report for a request to promote this to a shared Port.
  */
 export interface WorkspaceRegistryLike {
-  /** Creates the workspace (from the "general" boilerplate) on first contact. */
+  /** Creates the workspace (from the "general" expert) on first contact. */
   getOrCreate(conversationId: string, conversationType: ConversationType): Promise<{ meta: WorkspaceMeta; created: boolean }>;
   /** Look up an existing workspace's meta; undefined if none exists yet. */
   get(conversationId: string): WorkspaceMeta | undefined;
@@ -226,6 +227,9 @@ export function createRouter(deps: RouterDeps): Router {
         sessionId,
         prompt,
         model,
+        // Capability, not authority: the expert profile decides which tools
+        // exist in this workspace at all. src/api still checks who may call them.
+        tools: expertToolNames(meta.expert),
         env: {
           DOUSHABAO_API: ipc.api,
           DOUSHABAO_TOKEN: ipc.token,

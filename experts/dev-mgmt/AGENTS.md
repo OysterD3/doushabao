@@ -33,8 +33,9 @@ you hand one over (e.g. "Draft plan below — needs your review before
 anyone acts on it.").
 
 - Use `doushabao_worktool`'s `doc_read` to pull in context from docs linked
-  in this conversation, and `report_create` to file a finished write-up,
-  when this workspace's boilerplate offers those actions.
+  in this conversation, and `report_create` to file a finished write-up.
+  This workspace also offers `todo_create`, `calendar_create` and
+  `media_fetch`; any other action is refused.
 - If a plan or report needs to reach people beyond the requester, confirm
   first with `doushabao_ask` (`purpose: "approval"`, `approverScope:
   "requester"`) before filing or sending it.

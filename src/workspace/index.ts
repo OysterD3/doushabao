@@ -1,7 +1,7 @@
 /**
  * Workspace registry — src/workspace.
  *
- * Owns: workspace creation from boilerplate + workspace.json meta CRUD,
+ * Owns: workspace creation from expert + workspace.json meta CRUD,
  * transcript append/tail, KB shared+overlay with provenance/promote/revoke,
  * memory admin ops, unanswered/escalation records.
  *
@@ -12,9 +12,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { paths, wsPaths } from "../shared/paths.ts";
-import type { Boilerplate, Config, ConversationType, KbEntry, ToolResponse, WorkspaceMeta } from "../shared/types.ts";
-import { instantiateBoilerplate } from "../pi/index.ts";
+import { UUID_RE, paths, resolveInside, wsPaths } from "../shared/paths.ts";
+import type { Config, ConversationType, Expert, KbEntry, ToolResponse, WorkspaceMeta } from "../shared/types.ts";
+import { EXPERTS } from "../shared/types.ts";
+import { instantiateExpert } from "../pi/index.ts";
 import { appendJsonl, slug, writeFileAtomic } from "./fs-util.ts";
 import { deleteKbEntry, readKbEntries, readKbEntry, writeKbEntry } from "./kb.ts";
 
@@ -44,8 +45,6 @@ export interface WorkspaceRegistry {
 
 const MEMORY_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const KB_DIGEST_CAP = 4000;
-/** Runtime companion of the Boilerplate union — a patch arrives as plain JSON. */
-const BOILERPLATES: readonly Boilerplate[] = ["general", "qa-cs", "project", "dev-mgmt"];
 
 const kbDirFor = (dir: string) => wsPaths(dir).kb;
 const memoryDirFor = (dir: string) => join(dir, "memory");
@@ -58,7 +57,16 @@ function scanWorkspaces(): Map<string, WorkspaceMeta> {
     const metaFile = wsPaths(dir).meta;
     if (!existsSync(metaFile)) continue;
     try {
-      const meta = JSON.parse(readFileSync(metaFile, "utf8")) as WorkspaceMeta;
+      const parsed = JSON.parse(readFileSync(metaFile, "utf8")) as WorkspaceMeta & { boilerplate?: Expert };
+      // Migrate the pre-rename field: a workspace.json written before
+      // boilerplate→expert has `boilerplate` and no `expert`. Without this it
+      // loads with expert=undefined and silently falls back to `general`,
+      // downgrading a qa-cs/project/dev-mgmt room's tools on upgrade.
+      const expert: Expert = parsed.expert ?? parsed.boilerplate ?? "general";
+      // `dir` is the root of every containment check in this module, so it is
+      // never taken from the file's own contents — a workspace.json rewritten
+      // to point somewhere else would relocate the whole workspace with it.
+      const meta: WorkspaceMeta = { ...parsed, expert, dir };
       map.set(meta.conversationId, meta);
     } catch {
       /* skip corrupt workspace.json */
@@ -105,15 +113,18 @@ export function createWorkspaceRegistry(cfg: Config): WorkspaceRegistry {
     let inflight = creating.get(cid);
     if (!inflight) {
       inflight = (async () => {
-        const dir = join(paths.workspaces, slug(cid));
+        // slug() sanitizes the conversation id, resolveInside contains the
+        // result — a sanitizer alone fails open the day its character class
+        // grows, so the containment check is not redundant with it.
+        const dir = resolveInside(paths.workspaces, slug(cid));
         mkdirSync(dir, { recursive: true });
-        await instantiateBoilerplate("general", dir);
+        await instantiateExpert("general", dir);
         for (const sub of ["jobs", "kb", "media", "memory"]) mkdirSync(join(dir, sub), { recursive: true });
         const meta: WorkspaceMeta = {
           conversationId: cid,
           conversationType: type,
           dir,
-          boilerplate: "general",
+          expert: "general",
           editors: [],
           multimodal: false,
           digestsEnabled: false,
@@ -144,16 +155,16 @@ export function createWorkspaceRegistry(cfg: Config): WorkspaceRegistry {
 
   async function patchMeta(cid: string, patch: Partial<WorkspaceMeta>): Promise<WorkspaceMeta> {
     const meta = requireMeta(cid);
-    // A boilerplate switch must re-materialize the new template on disk, else
-    // the workspace keeps running the old AGENTS.md forever. instantiateBoilerplate
+    // A expert switch must re-materialize the new template on disk, else
+    // the workspace keeps running the old AGENTS.md forever. instantiateExpert
     // only rewrites template files (AGENTS.md, .pi/), so kb/, memory/, jobs/ and
     // the transcript survive. Do it before writeMeta: a failed copy must leave
     // meta pointing at the template that is actually on disk.
-    if (patch.boilerplate !== undefined && patch.boilerplate !== meta.boilerplate) {
-      if (!BOILERPLATES.includes(patch.boilerplate)) {
-        throw new Error(`workspace registry: unknown boilerplate "${patch.boilerplate}"`);
+    if (patch.expert !== undefined && patch.expert !== meta.expert) {
+      if (!EXPERTS.includes(patch.expert)) {
+        throw new Error(`workspace registry: unknown expert "${patch.expert}"`);
       }
-      await instantiateBoilerplate(patch.boilerplate, meta.dir);
+      await instantiateExpert(patch.expert, meta.dir);
     }
     // Identity fields are never overwritten by a patch, even if present on it.
     const updated: WorkspaceMeta = { ...meta, ...patch, conversationId: meta.conversationId, dir: meta.dir, createdAt: meta.createdAt };
@@ -202,6 +213,7 @@ export function createWorkspaceRegistry(cfg: Config): WorkspaceRegistry {
 
   async function kbPromote(kbId: string, actor: string): Promise<KbEntry | undefined> {
     void actor; // provenance (injectedBy/injectedAt) is kept as the original injector's, per contract
+    if (!UUID_RE.test(kbId)) return undefined; // refuse before any disk access; kbEntryFile is the backstop
     if (readKbEntry(paths.sharedKb, kbId)) return undefined; // already global
     for (const meta of metaMap.values()) {
       const dir = kbDirFor(meta.dir);
@@ -218,6 +230,7 @@ export function createWorkspaceRegistry(cfg: Config): WorkspaceRegistry {
 
   async function kbRevoke(kbId: string, actor: string): Promise<boolean> {
     void actor;
+    if (!UUID_RE.test(kbId)) return false; // refuse before any disk access; kbEntryFile is the backstop
     const sharedEntry = readKbEntry(paths.sharedKb, kbId);
     if (sharedEntry) {
       if (!sharedEntry.revoked) writeKbEntry(paths.sharedKb, { ...sharedEntry, revoked: true });
@@ -280,7 +293,9 @@ export function createWorkspaceRegistry(cfg: Config): WorkspaceRegistry {
     if (!name || !MEMORY_NAME_RE.test(name)) {
       return { ok: false, message: "invalid memory file name (letters, digits, - and _ only)" };
     }
-    const file = join(dir, `${name}.md`);
+    // Second layer: the regex already refuses a traversing name, but it fails
+    // open the day the name reaches here from a field nobody re-checked.
+    const file = resolveInside(dir, `${name}.md`);
 
     if (op === "read") {
       if (!existsSync(file)) return { ok: false, message: `memory file not found: ${name}` };

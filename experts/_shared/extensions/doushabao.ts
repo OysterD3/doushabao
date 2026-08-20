@@ -4,7 +4,7 @@
  *
  * SELF-CONTAINED: this file has no imports from doushabao's src/, because it
  * is copied verbatim into every workspace's `.pi/extensions/` directory
- * (see src/pi/boilerplate.ts) and loaded there by pi itself, which resolves
+ * (see src/pi/expert.ts) and loaded there by pi itself, which resolves
  * `typebox` and `@earendil-works/pi-coding-agent` from its own install, not
  * from the workspace. The `ExtensionAPI`/`ExtensionContext` import below is
  * `import type` only, so it is erased at runtime and never needs resolving.
@@ -196,7 +196,7 @@ const TOOLS: ToolSpec[] = [
     label: "Run a work-tool action",
     toolName: "worktool",
     description:
-      "Run a curated DingTalk work-tool action, e.g. \"todo_create\", \"calendar_create\", \"doc_read\", \"report_create\" (availability depends on this workspace's boilerplate). doc_read only works on links shared in this conversation. Any write that affects a colleague needs their one-tap confirm first via doushabao_ask (purpose \"approval\", approverScope \"requester\") before you call this.",
+      "Run a curated DingTalk work-tool action, e.g. \"todo_create\", \"calendar_create\", \"doc_read\", \"report_create\". Each expert offers only some of these: an action outside this workspace's expert profile is refused, not performed, so use the actions this workspace's AGENTS.md names and report a refusal instead of retrying it. doc_read only works on links shared in this conversation. Any write that affects a colleague needs their one-tap confirm first via doushabao_ask (purpose \"approval\", approverScope \"requester\") before you call this.",
     parameters: Type.Object({
       action: Type.String({ description: "The curated action name, e.g. \"todo_create\"." }),
       params: Type.Any({ description: "Action-specific parameters, per the action's own documented shape." }),
@@ -206,11 +206,17 @@ const TOOLS: ToolSpec[] = [
     name: "doushabao_set_workspace",
     label: "Update workspace settings",
     toolName: "set_workspace",
-    description: "Update this workspace's settings (boilerplate, editors, owner, multimodal, digestsEnabled, modelOverride). Privileged; the orchestrator enforces who may do this.",
+    description: "Update this workspace's settings (expert, editors, owner, multimodal, digestsEnabled, modelOverride). Privileged; the orchestrator enforces who may do this.",
     parameters: Type.Object({
       patch: Type.Object({
-        boilerplate: Type.Optional(
-          Type.Union([Type.Literal("general"), Type.Literal("qa-cs"), Type.Literal("project"), Type.Literal("dev-mgmt")]),
+        expert: Type.Optional(
+          Type.Union([
+            Type.Literal("general"),
+            Type.Literal("qa-cs"),
+            Type.Literal("project"),
+            Type.Literal("dev-mgmt"),
+            Type.Literal("debug"),
+          ]),
         ),
         editors: Type.Optional(Type.Array(Type.String(), { description: "open_dingtalk_ids of this workspace's editors." })),
         owner: Type.Optional(Type.String({ description: "open_dingtalk_id of the named human owner for escalation." })),

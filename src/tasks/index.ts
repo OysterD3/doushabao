@@ -15,8 +15,9 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { paths } from "../shared/paths.ts";
-import type { Config, DelegatedTask, PiRunnerPort } from "../shared/types.ts";
+import { assertUuid, paths, resolveInside } from "../shared/paths.ts";
+import { expertToolNames } from "../shared/types.ts";
+import type { Config, DelegatedTask, Expert, PiRunnerPort } from "../shared/types.ts";
 
 const MAX_CONCURRENT_WORKERS = 2;
 const RESULT_SUMMARY_MAX_CHARS = 2000;
@@ -39,7 +40,7 @@ export interface TasksDeps {
 
 /** Minimal shape expected from `deps.workspaces` (untyped Port; see final report). */
 interface WorkspaceLookup {
-  get(conversationId: string): { dir: string; modelOverride?: string; multimodal?: boolean; paused?: boolean } | undefined;
+  get(conversationId: string): { dir: string; expert?: Expert; modelOverride?: string; multimodal?: boolean; paused?: boolean } | undefined;
 }
 
 /** Model precedence, identical to the router's: an explicit per-workspace
@@ -52,7 +53,11 @@ function pickModel(cfg: Config, ws: { modelOverride?: string; multimodal?: boole
 }
 
 function taskFile(id: string): string {
-  return join(paths.tasks, `${id}.json`);
+  // Same two-layer containment as cron jobFile / kb kbEntryFile / pending
+  // fileFor: task ids are always randomUUID(), so a non-uuid id is either a
+  // bug or a traversal attempt. assertUuid rejects it; resolveInside is the
+  // backstop if a future caller forgets.
+  return resolveInside(paths.tasks, `${assertUuid("task", id)}.json`);
 }
 
 async function persist(task: DelegatedTask): Promise<void> {
@@ -187,6 +192,9 @@ export function createTasks(deps: TasksDeps): Tasks {
         sessionId: `task-${id}`,
         prompt: buildTaskPrompt(task),
         model: pickModel(deps.cfg, ws),
+        // Capability, not authority: the model never sees a tool this
+        // workspace's expert profile does not grant. src/api still re-checks.
+        tools: expertToolNames(ws.expert),
         env: {
           DOUSHABAO_API: deps.ipc.api,
           DOUSHABAO_TOKEN: deps.ipc.token,

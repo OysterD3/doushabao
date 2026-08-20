@@ -11,7 +11,10 @@
  *                     per-key offset file `<events>.offset.<key>` so restarts
  *                     resume where they left off.
  *   FAKE_DWS_OUTBOX   JSONL file; every non-consume invocation appends
- *                     {ts, argv} here. Assertions read this.
+ *                     {ts, argv, messageId?} here. Assertions read this.
+ *                     `messageId` is set for `+messages-send` and is the same
+ *                     id printed on stdout, so a test can react to the exact
+ *                     message a send produced.
  *   FAKE_DWS_CRASH_AFTER  If set (N), a consumer exits(1) after emitting N
  *                     lines — for supervision/restart tests.
  *
@@ -63,9 +66,24 @@ if (argv[0] === "event" && argv[1] === "consume") {
   setInterval(tick, 100);
 } else {
   const outbox = process.env.FAKE_DWS_OUTBOX;
+
+  // A real dws reports the id of the message it just posted, and the
+  // orchestrator binds a pending question to that exact id so a reaction on
+  // some OTHER message cannot answer it. The id must therefore be unique per
+  // send: a fake that reused one id per conversation would let a
+  // wrong-message reaction pass, which is precisely the bug the binding
+  // exists to prevent. Sequence off the outbox so it stays deterministic.
+  let messageId: string | undefined;
+  if (argv.includes("+messages-send")) {
+    const sent = outbox && existsSync(outbox) ? readFileSync(outbox, "utf8").split("\n").filter(Boolean).length : 0;
+    messageId = `fake-msg-${sent + 1}`;
+  }
+
   if (outbox) {
     mkdirSync(dirname(outbox), { recursive: true });
-    appendFileSync(outbox, JSON.stringify({ ts: Date.now(), argv }) + "\n");
+    // messageId is recorded too, so a test can discover which message a given
+    // send became without having to predict the id.
+    appendFileSync(outbox, JSON.stringify({ ts: Date.now(), argv, messageId }) + "\n");
   }
   if (argv.includes("--download-resources")) {
     const dir = flagValue("--output-dir");
@@ -81,5 +99,5 @@ if (argv[0] === "event" && argv[1] === "consume") {
       writeFileSync(out, "# fake doc\n\nExported by fake-dws.\n");
     }
   }
-  process.stdout.write(JSON.stringify({ ok: true }) + "\n");
+  process.stdout.write(JSON.stringify(messageId ? { ok: true, message_id: messageId } : { ok: true }) + "\n");
 }
