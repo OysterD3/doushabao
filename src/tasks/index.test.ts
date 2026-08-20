@@ -319,11 +319,13 @@ describe("retry", () => {
 });
 
 describe("concurrency", () => {
-  test("caps active workers at 2; a 3rd task waits until one finishes", async () => {
+  test("caps active workers at the configured maxConcurrentTasks; the next waits", async () => {
+    // Drive the cap through config (2 here) — the point of making it a budget.
+    const cappedCfg = ConfigSchema.parse({ budgets: { maxConcurrentTasks: 2 } });
     const releasers = new Map<string, (r: { text: string; ok: boolean }) => void>();
     const { enqueueRun } = collectingEnqueue();
     const tasks = createTasks({
-      cfg,
+      cfg: cappedCfg,
       runner: {
         run: (opts) =>
           new Promise((resolve) => {

@@ -64,6 +64,10 @@ export const ConfigSchema = z.object({
       perWorkspaceDailyRuns: z.number().int().default(200),
       perUserDailyRuns: z.number().int().default(60),
       writesPerWorkspacePerHour: z.number().int().default(20),
+      /** How many delegated background tasks run at once across all
+       * conversations. Foreground message replies are on a separate path, so
+       * this only bounds background work — raise it for busy deployments. */
+      maxConcurrentTasks: z.number().int().default(3),
     })
     .prefault({}),
   caps: z
@@ -100,6 +104,21 @@ export const ConfigSchema = z.object({
       hour: z.number().int().default(3),
     })
     .prefault({}),
+  /** Extra pi extensions to load into every workspace agent — web search, MCP,
+   * etc. Each is loaded by explicit `path` (never inherited via discovery), and
+   * ONLY the tool names listed in `tools` are allowed through the fail-closed
+   * `-t` allowlist. MCP tool names are dynamic per server, so you must list the
+   * exact ones you want exposed. SECURITY: every tool here is reachable by a
+   * prompt-injected, chat-facing agent — web tools are an egress channel, MCP
+   * tools are whatever the server exposes. Empty by default. */
+  piExtraExtensions: z
+    .array(
+      z.object({
+        path: z.string(),
+        tools: z.array(z.string()).default([]),
+      }),
+    )
+    .default([]),
   /** Version the workspace tree (one dir per group chat) as its own git repo.
    * The daemon commits coalesced snapshots on a timer — NEVER per message —
    * off the message path, and pushes to `remote` on a slower timer. Commit

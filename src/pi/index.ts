@@ -83,8 +83,20 @@ export function createPiRunner(cfg: Config): PiRunnerPort {
       // An earlier `opts.tools?.length` check treated [] like undefined and
       // enabled everything; that inverted the boundary and is the one place a
       // forgotten value would grant, not deny.
-      if (opts.tools.length > 0) argv.push("-t", opts.tools.join(","));
-      else argv.push("-nt");
+      // Extra pi extensions (web search, MCP, ...) are opt-in per config and,
+      // per the operator's choice, apply to every real run. They are loaded by
+      // explicit `-e` path (never inherited via discovery, which -ne blocks)
+      // and their tool names are added to the `-t` allowlist — so the boundary
+      // stays fail-closed: only the tools the operator names get through. This
+      // is why MCP tools must be enumerated in config; their names are not
+      // known here. A tool-less run (nightly, tools:[]) gets NONE of this.
+      const extras = opts.tools.length > 0 ? cfg.piExtraExtensions : [];
+      if (opts.tools.length > 0) {
+        const allTools = [...opts.tools, ...extras.flatMap((e) => e.tools)];
+        argv.push("-t", allTools.join(","));
+      } else {
+        argv.push("-nt");
+      }
       // Tool surface, locked down in three flags — see ARCHITECTURE.md:
       //  -nbt  no built-in tools (no shell/write/edit) — the no-exec rule.
       //  -ne   no extension DISCOVERY. Without it a workspace inherits every
@@ -108,6 +120,9 @@ export function createPiRunner(cfg: Config): PiRunnerPort {
       //        project-local extensions after the project is "trusted", and
       //        nothing can grant that trust in a headless -p run.
       argv.push("-nbt", "-ne", "-nc", "-ns", "-np", "-e", SHARED_EXTENSION);
+      // Each opt-in extra extension is loaded by explicit path too (still no
+      // discovery). Its tools were added to the -t allowlist above.
+      for (const extra of extras) argv.push("-e", extra.path);
       // -nc disabled discovery of EVERY context file, including this
       // workspace's own AGENTS.md — which is the expert persona. Put it back
       // explicitly, so the agent gets exactly one context file: its own.

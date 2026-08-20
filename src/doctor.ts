@@ -107,6 +107,15 @@ function expertsCheck(): Check {
     : { status: "fail", label: "expert templates", detail: `missing: ${missing.join(", ")}` };
 }
 
+function extraExtensionsCheck(cfg: Config | undefined): Check | undefined {
+  const extras = cfg?.piExtraExtensions ?? [];
+  if (extras.length === 0) return undefined; // nothing configured — don't clutter the report
+  const missing = extras.filter((e) => !existsSync(e.path));
+  return missing.length === 0
+    ? { status: "ok", label: "extra pi extensions", detail: `${extras.length} loadable` }
+    : { status: "fail", label: "extra pi extensions", detail: `path not found: ${missing.map((e) => e.path).join(", ")}` };
+}
+
 const ICON: Record<Status, string> = { ok: "✓", warn: "!", fail: "✗" };
 
 export async function runDoctor(): Promise<number> {
@@ -120,6 +129,8 @@ export async function runDoctor(): Promise<number> {
     expertsCheck(),
     await portCheck(cfg),
   ];
+  const extras = extraExtensionsCheck(cfg);
+  if (extras) checks.push(extras);
 
   process.stdout.write("\ndoushabao doctor\n\n");
   for (const c of checks) process.stdout.write(`  ${ICON[c.status]}  ${c.label.padEnd(22)} ${c.detail}\n`);

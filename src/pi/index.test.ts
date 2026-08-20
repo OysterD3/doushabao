@@ -188,6 +188,52 @@ describe("createPiRunner", () => {
       expect(entry.prompt).toBe("x");
     });
 
+    test("extra extensions add their -e path and merge only their named tools into the allowlist", async () => {
+      tmp = mkdtempSync(join(tmpdir(), "doushabao-pi-"));
+      const scenario = join(tmp, "scenario.json");
+      const log = join(tmp, "log.jsonl");
+      writeFileSync(scenario, JSON.stringify({ default: { text: "ok" } }));
+      const runner = createPiRunner(
+        makeConfig({
+          piBin: FAKE_PI,
+          piExtraExtensions: [{ path: "/opt/pi-web-access/index.ts", tools: ["web_search", "fetch_content"] }],
+        }),
+      );
+
+      await runner.run({
+        workspaceDir: tmp,
+        sessionId: "s1",
+        prompt: "x",
+        env: { FAKE_PI_SCENARIO: scenario, FAKE_PI_LOG: log },
+        tools: ["doushabao_send"],
+      });
+
+      const { argv } = lastLogEntry(log);
+      // Fail-closed: the allowlist is exactly the expert's tools plus the named
+      // extra tools — nothing else the extension might register slips through.
+      expect(argv[argv.indexOf("-t") + 1]).toBe("doushabao_send,web_search,fetch_content");
+      // The extra extension is loaded by explicit path, alongside ours.
+      expect(argv.filter((a) => a === "-e")).toHaveLength(2);
+      expect(argv).toContain("/opt/pi-web-access/index.ts");
+    });
+
+    test("a tool-less run (nightly) gets NO extra extensions even when configured", async () => {
+      tmp = mkdtempSync(join(tmpdir(), "doushabao-pi-"));
+      const scenario = join(tmp, "scenario.json");
+      const log = join(tmp, "log.jsonl");
+      writeFileSync(scenario, JSON.stringify({ default: { text: "ok" } }));
+      const runner = createPiRunner(
+        makeConfig({ piBin: FAKE_PI, piExtraExtensions: [{ path: "/opt/pi-web-access/index.ts", tools: ["web_search"] }] }),
+      );
+
+      await runner.run({ workspaceDir: tmp, sessionId: "s1", prompt: "x", env: { FAKE_PI_SCENARIO: scenario, FAKE_PI_LOG: log }, tools: [] });
+
+      const { argv } = lastLogEntry(log);
+      expect(argv).toContain("-nt");
+      expect(argv).not.toContain("/opt/pi-web-access/index.ts");
+      expect(argv.filter((a) => a === "-e")).toHaveLength(1); // only the shared doushabao extension
+    });
+
     test("an empty tools list is fail-CLOSED: -nt (no tools), not every-tool-enabled", async () => {
       tmp = mkdtempSync(join(tmpdir(), "doushabao-pi-"));
       const scenario = join(tmp, "scenario.json");

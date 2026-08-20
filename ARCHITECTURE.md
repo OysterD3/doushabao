@@ -94,6 +94,15 @@ adversarial audit and each has a test that fails without it.
 | Secrets do not reach children | `allowlistedEnv()` in `src/shared/env.ts` is the one home for the rule; every dws-family spawn (dws adapter, worktools, git snapshotter) passes an allowlist and the whole `DOUSHABAO_*` namespace (IPC token, root) is excluded. pi is the sole exception — its extension reads `DOUSHABAO_*` by the IPC contract. |
 | Authority cannot be borrowed | Answering a pending question does **not** confer the answerer's identity on the resumed run. An **approval is resolved ONLY by a reaction bound to the exact posted message** — never by a text reply, which carries no message binding and could otherwise be a reply meant for a newer question farming an older open approval's `onApprove` write. Text replies answer questions only. |
 
+**Opt-in surface expansion:** `cfg.piExtraExtensions` loads additional pi
+extensions (web search, MCP) into every workspace agent. Each is loaded by
+explicit `-e` path (never via discovery) and only the tool names it lists reach
+the fail-closed `-t` allowlist. But those tools ARE then reachable by a
+prompt-injectable agent — web tools are egress, MCP tools are whatever the
+server exposes. This is off by default and is a deliberate operator choice; the
+rest of the model above still holds around it. Tool-less runs (nightly) get none
+of it.
+
 **Known residual risk, accepted:** a compromised `dws` or `pi` binary is outside
 these controls, and the model provider necessarily sees conversation content.
 Neither is reachable from this codebase.

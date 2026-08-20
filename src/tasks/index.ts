@@ -19,7 +19,7 @@ import { assertUuid, paths, resolveInside } from "../shared/paths.ts";
 import { expertToolNames } from "../shared/types.ts";
 import type { Config, DelegatedTask, Expert, PiRunnerPort } from "../shared/types.ts";
 
-const MAX_CONCURRENT_WORKERS = 2;
+
 const RESULT_SUMMARY_MAX_CHARS = 2000;
 
 export interface Tasks {
@@ -137,7 +137,7 @@ export function createTasks(deps: TasksDeps): Tasks {
   }
 
   function pump(): void {
-    while (activeWorkers < MAX_CONCURRENT_WORKERS) {
+    while (activeWorkers < deps.cfg.budgets.maxConcurrentTasks) {
       const next = [...tasksById.values()]
         .filter((t) => t.status === "queued" && !isPaused(t))
         .sort((a, b) => a.createdAt - b.createdAt)[0];

@@ -247,7 +247,7 @@ describe("router", () => {
     const { registry } = makeFakeWorkspaces(rootDir);
     const { dws, sent } = makeFakeDws();
     const { runner, calls } = makeFakeRunner(async () => ({ text: "ok", ok: true }));
-    const cfg = testConfig({ budgets: { perWorkspaceDailyRuns: 1, perUserDailyRuns: 200, writesPerWorkspacePerHour: 20 } });
+    const cfg = testConfig({ budgets: { perWorkspaceDailyRuns: 1, perUserDailyRuns: 200, writesPerWorkspacePerHour: 20, maxConcurrentTasks: 3 } });
     const router = createRouter({ cfg, dws, runner, workspaces: registry, ipc: { api: "http://x", token: "t" } });
 
     await router.handleEvent(dmMessage({ conversationId: "c-budget", senderId: "u1" }));
@@ -263,7 +263,7 @@ describe("router", () => {
     const { registry } = makeFakeWorkspaces(rootDir);
     const { dws, sent } = makeFakeDws();
     const { runner, calls } = makeFakeRunner(async () => ({ text: "ok", ok: true }));
-    const cfg = testConfig({ budgets: { perWorkspaceDailyRuns: 200, perUserDailyRuns: 1, writesPerWorkspacePerHour: 20 } });
+    const cfg = testConfig({ budgets: { perWorkspaceDailyRuns: 200, perUserDailyRuns: 1, writesPerWorkspacePerHour: 20, maxConcurrentTasks: 3 } });
     const router = createRouter({ cfg, dws, runner, workspaces: registry, ipc: { api: "http://x", token: "t" } });
 
     await router.handleEvent(dmMessage({ conversationId: "c-u1", senderId: "u-budget" }));

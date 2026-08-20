@@ -206,7 +206,53 @@ startup banner. `SIGINT`/`SIGTERM` trigger a graceful stop (dws consumers
 stop, cron stops, the HTTP API stops, a final workspace snapshot is committed
 and pushed, then exit).
 
-## 9. Versioning the workspace tree as a git repo (optional)
+## 9. Web search and MCP tools (optional, and a security tradeoff)
+
+The workspace agent can be given web search (`pi-web-access`) and MCP tools
+(`pi-mcp-adapter`). These are NOT inherited from your global pi install — the
+daemon runs pi with `-ne`, so nothing is auto-discovered. You load them
+explicitly and allowlist exactly which of their tools may be called.
+
+> **Read this first.** Every tool you add here is reachable by a chat-facing,
+> prompt-injectable agent. Web tools are an **outbound-fetch / exfiltration
+> channel**; MCP tools are whatever the servers you connect expose. This
+> deliberately widens the surface the rest of the daemon works to keep closed.
+> Turn it on only if you want it, and keep the MCP server list tight.
+
+1. Install the extensions under the daemon's account:
+
+   ```sh
+   pi install npm:pi-web-access
+   pi install npm:pi-mcp-adapter
+   ```
+
+2. Add them to `config/doushabao.json`, pointing `path` at where `pi` installed
+   them (usually `~/.pi/agent/npm/node_modules/<pkg>/index.ts`), and listing the
+   exact tool names to allow — the allowlist is fail-closed, so only what you
+   name gets through:
+
+   ```json
+   "piExtraExtensions": [
+     { "path": "/Users/you/.pi/agent/npm/node_modules/pi-web-access/index.ts",
+       "tools": ["web_search", "source_check", "fetch_content", "get_search_content"] },
+     { "path": "/Users/you/.pi/agent/npm/node_modules/pi-mcp-adapter/index.ts",
+       "tools": ["mcp", "mcpScript"] }
+   ]
+   ```
+
+3. These need their own credentials, which the doctor can't supply:
+   - **Web search** needs a provider key (Brave / Exa / Tavily / Perplexity /
+     Gemini / OpenAI — see the `pi-web-access` README). Without one, `web_search`
+     returns nothing.
+   - **MCP** reads its server list from `~/.pi/agent/mcp.json` (or `.mcp.json`).
+     Configure only the servers you trust; `pi-mcp-adapter init` scaffolds one.
+
+These apply to **every** workspace run (all experts), except the tool-less
+nightly distillation. Nothing lists MCP tools by dynamic name — the `mcp`
+proxy tool is the interface; the adapter discovers server tools on demand
+behind it.
+
+## 10. Versioning the workspace tree as a git repo (optional)
 
 The workspace tree — one directory per group chat, holding transcripts,
 memory, knowledge base, jobs and downloaded attachments — can be its own git
