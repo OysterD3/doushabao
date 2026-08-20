@@ -20,8 +20,12 @@ import { createCron } from "./cron/index.ts";
 import { createApi } from "./api/index.ts";
 import { createGitSnapshotter } from "./gitsnapshot/index.ts";
 import { createRouter, type RunOpts } from "./router/index.ts";
+import { runDoctor } from "./doctor.ts";
 
 async function main() {
+  if (process.argv.includes("--doctor")) {
+    process.exit(await runDoctor());
+  }
   const cfg = loadConfig();
   ensureVarDirs();
 

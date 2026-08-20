@@ -72,6 +72,14 @@ Copy the example and edit it:
 cp config/doushabao.example.json config/doushabao.json
 ```
 
+At any point, run the preflight to see which of the steps below still need
+doing — it checks Node, the config, `dws`/`pi` install + auth, the model, the
+expert templates, and the IPC port:
+
+```sh
+node src/index.ts --doctor
+```
+
 `config/doushabao.json` is gitignored, because it holds real DingTalk admin
 IDs. The daemon reads it through `ConfigSchema` (`src/shared/types.ts`) —
 every field has a default, so the file can be sparse or absent. Example:
